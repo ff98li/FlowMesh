@@ -1,0 +1,133 @@
+import re
+from enum import StrEnum
+
+from docker.types import DeviceRequest
+from pydantic import BaseModel
+
+from .. import env
+from ..utils.helpers import get_docker_client
+
+
+class GpuArch(StrEnum):
+    BLACKWELL = "blackwell"
+    HOPPER = "hopper"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def from_name(cls, name: str) -> "GpuArch":
+        name = name.strip().lower()
+        blackwell_pattern = r"(rtx50|5090|5080|5070|b100|b200|gb200|gb100|blackwell)"
+        if re.search(blackwell_pattern, name):
+            return cls.BLACKWELL
+        hopper_pattern = r"(h100|h800|h200|hopper)"
+        if re.search(hopper_pattern, name):
+            return cls.HOPPER
+        return cls.UNKNOWN
+
+
+class MachineEnv(BaseModel):
+    cpu_count: int
+    gpu_families: dict[int, GpuArch]
+    available_gpus: set[int]
+
+    @property
+    def gpu_count(self) -> int:
+        return len(self.gpu_families)
+
+
+class ResourceManager:
+    _instance: "ResourceManager | None" = None
+
+    def __init__(self) -> None:
+        self._docker_client = get_docker_client()
+        self._env = self._detect_machine_env()
+
+    @classmethod
+    def get_instance(cls) -> "ResourceManager":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @property
+    def total_gpu_count(self) -> int:
+        return self._env.gpu_count
+
+    @property
+    def available_gpu_count(self) -> int:
+        return len(self._env.available_gpus)
+
+    def next_available_gpus(self, n: int = 1) -> list[int]:
+        available_gpus = self._env.available_gpus
+        if n <= 0:
+            raise ValueError("Invalid number of GPUs")
+        if n > len(available_gpus):
+            raise ValueError("Not enough available GPUs")
+        if n == 1:
+            return [min(available_gpus)]
+        return sorted(available_gpus)[:n]
+
+    def allocate_gpus(self, devices: list[int]) -> GpuArch:
+        # Check availability
+        available_gpus = self._env.available_gpus
+        invalid_devices: list[int] = []
+        for dev in devices:
+            if dev not in available_gpus:
+                invalid_devices.append(dev)
+        if invalid_devices:
+            raise ValueError(f"Requested GPUs are not available: {invalid_devices}")
+
+        # Check architecture consistency
+        gpu_archs = {self._env.gpu_families[dev] for dev in devices}
+        if len(gpu_archs) != 1:
+            raise ValueError("Selected CUDA devices have different architectures.")
+        gpu_arch = gpu_archs.pop()
+
+        available_gpus.difference_update(devices)
+        return gpu_arch
+
+    def deallocate_gpus(self, devices: list[int]) -> None:
+        self._env.available_gpus.update(devices)
+
+    def _detect_machine_env(self) -> MachineEnv:
+        info = self._docker_client.info()
+        cpu_count = info.get("NCPU", 0)
+
+        gpu_families: dict[int, GpuArch] = {}
+        available_gpus: set[int] = set()
+
+        visible_devices: set[int] | None
+        if env.CUDA_VISIBLE_DEVICES is None:
+            visible_devices = None
+        else:
+            try:
+                visible_devices = {
+                    int(dev.strip()) for dev in env.CUDA_VISIBLE_DEVICES.split(",")
+                }
+            except Exception:
+                visible_devices = set()
+
+        if visible_devices is None or len(visible_devices) > 0:
+            # Detect GPUs using nvidia-smi if available
+            try:
+                nvidia_smi_output = self._docker_client.containers.run(
+                    image="nvidia/cuda:12.1.0-base-ubuntu22.04",
+                    device_requests=[DeviceRequest(count=-1, capabilities=[["gpu"]])],
+                    command="nvidia-smi --query-gpu=index,name --format=csv,noheader",
+                    remove=True,
+                    runtime="nvidia",
+                )
+                output_str = nvidia_smi_output.decode("utf-8").strip()
+                for line in output_str.split("\n"):
+                    index_str, name = line.split(",", maxsplit=1)
+                    index = int(index_str.strip())
+                    if visible_devices is None or index in visible_devices:
+                        available_gpus.add(index)
+                        gpu_families[index] = GpuArch.from_name(name)
+            except Exception:
+                pass
+
+        return MachineEnv(
+            cpu_count=cpu_count,
+            gpu_families=gpu_families,
+            available_gpus=available_gpus,
+        )

@@ -1,0 +1,53 @@
+ARG TZ=Asia/Singapore
+ARG CUDA_VERSION=12.9.1
+ARG UBUNTU_VERSION=24.04
+ARG TORCH_CUDA_ARCH_LIST='7.0 7.5 8.0 8.9 9.0 10.0 12.0'
+
+# Builder stage keeps development-only CUDA bits
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+ARG TZ
+ARG CUDA_VERSION
+ARG TORCH_CUDA_ARCH_LIST
+ENV TZ=${TZ} \
+    DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_TORCH_BACKEND=cu129 \
+    UV_HTTP_TIMEOUT=500 \
+    UV_INDEX_STRATEGY="unsafe-best-match" \
+    UV_LINK_MODE=copy \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+ && echo $TZ > /etc/timezone \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl git gnupg2 software-properties-common tini tzdata \
+      ccache libnuma-dev libibverbs-dev \
+ && dpkg-reconfigure -f noninteractive tzdata \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install Python 3.12 via deadsnakes PPA
+RUN add-apt-repository ppa:deadsnakes/ppa -y \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3.12 python3.12-venv python3.12-dev python3-pip \
+ && rm -rf /var/lib/apt/lists/*
+
+# Workaround for Triton/PyTorch CUDA compatibility issues
+# References: https://github.com/openai/triton/issues/2507
+#             https://github.com/pytorch/pytorch/issues/107960
+RUN ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/
+
+# Create isolated venv and upgrade pip + uv
+RUN python3.12 -m venv /opt/py312 \
+ && /opt/py312/bin/pip install --upgrade pip uv
+ENV PATH=/opt/py312/bin:$PATH
+
+WORKDIR /opt
+
+# Install GPU-specific dependencies (Heavy, rarely changes)
+COPY src/worker/requirements/requirements.gpu.txt /tmp/requirements.gpu.txt
+RUN uv pip install --python /opt/py312/bin/python --system --requirement /tmp/requirements.gpu.txt \
+ && rm -f /tmp/requirements.gpu.txt \
+ && rm -rf /root/.cache/uv /root/.cache/pip /root/.cache/ccache

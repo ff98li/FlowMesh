@@ -1,0 +1,18 @@
+default_worker_config:
+  hb_interval: 30
+
+workers:
+  - provider: vastai
+    init_on_start: true
+    worker_config:
+      worker_alias: vastai_gpu_worker_1
+      specs:
+        gpu_name: "=H100_NVL"
+      disk: 64
+  - provider: vastai
+    init_on_start: true
+    worker_config:
+      worker_alias: vastai_gpu_worker_2
+      specs:
+        gpu_name: "=H100_NVL"
+      disk: 64

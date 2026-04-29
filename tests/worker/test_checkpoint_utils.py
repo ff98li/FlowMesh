@@ -1,0 +1,106 @@
+"""Tests for the worker artifact helpers in checkpoints."""
+
+from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
+
+from worker.executors.base_executor import TaskReference
+from worker.executors.utils import checkpoints
+
+
+def _task(
+    dest_type: str = "http", dest_url: str = "http://host:8010/api/v1/results"
+) -> TaskReference:
+    if dest_type == "http":
+        destination = SimpleNamespace(
+            type="http",
+            method="POST",
+            url=dest_url,
+            headers={},
+            timeoutSec=30,
+        )
+    elif dest_type == "local":
+        destination = SimpleNamespace(type="local", path=None)
+    else:
+        destination = None
+    spec = SimpleNamespace(output=SimpleNamespace(destination=destination))
+    return cast(TaskReference, SimpleNamespace(task_id="task-1", spec=spec))
+
+
+class TestArtifactRef:
+    def test_returns_path_only(self) -> None:
+        assert checkpoints.artifact_ref("images/foo.png") == {"path": "images/foo.png"}
+
+
+class TestBuildArtifactContext:
+    def test_http_destination_strips_api_suffix(self, tmp_path: Path) -> None:
+        out_dir = tmp_path / "task-1"
+        out_dir.mkdir()
+        ctx = checkpoints.build_artifact_context(_task().spec, out_dir)
+        assert ctx["base_dir"] == out_dir.resolve().as_posix()
+        assert ctx["base_url"] == "http://host:8010"
+
+    def test_local_destination_leaves_base_url_none(self, tmp_path: Path) -> None:
+        out_dir = tmp_path / "task-1"
+        out_dir.mkdir()
+        ctx = checkpoints.build_artifact_context(_task("local").spec, out_dir)
+        assert ctx["base_dir"] == out_dir.resolve().as_posix()
+        assert ctx["base_url"] is None
+
+
+class TestMaybeUploadArtifacts:
+    def test_uploads_with_filename_relative_to_artifacts_dir(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        out_dir = tmp_path / "task-1"
+        artifacts_dir = out_dir / "artifacts"
+        (artifacts_dir / "images" / "nested").mkdir(parents=True)
+        first = artifacts_dir / "images" / "nested" / "a.png"
+        second = artifacts_dir / "final_model.tar.gz"
+        first.write_text("first", encoding="utf-8")
+        second.write_text("second", encoding="utf-8")
+
+        uploaded: list[tuple[str, str]] = []
+
+        class _Response:
+            def raise_for_status(self) -> None:
+                return None
+
+        def fake_request(method, url, files, headers, timeout):
+            assert method == "POST"
+            assert url == "http://host:8010/api/v1/results/task-1/files"
+            remote_name, _fh, _content_type = files["file"]
+            uploaded.append((remote_name, url))
+            return _Response()
+
+        monkeypatch.setattr(checkpoints.requests, "request", fake_request)
+
+        rel_paths = checkpoints.maybe_upload_artifacts(_task(), out_dir)
+        assert set(rel_paths) == {"images/nested/a.png", "final_model.tar.gz"}
+        assert {name for name, _url in uploaded} == {
+            "images/nested/a.png",
+            "final_model.tar.gz",
+        }
+
+    def test_local_destination_is_noop(self, tmp_path: Path, monkeypatch) -> None:
+        out_dir = tmp_path / "task-1"
+        (out_dir / "artifacts").mkdir(parents=True)
+        (out_dir / "artifacts" / "a.png").write_text("x", encoding="utf-8")
+
+        def fake_request(*args, **kwargs):
+            raise AssertionError("should not be called for local destination")
+
+        monkeypatch.setattr(checkpoints.requests, "request", fake_request)
+        assert checkpoints.maybe_upload_artifacts(_task("local"), out_dir) == []
+
+    def test_empty_artifacts_dir_returns_empty_list(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        out_dir = tmp_path / "task-1"
+        out_dir.mkdir()  # no artifacts/ subdir
+
+        def fake_request(*args, **kwargs):
+            raise AssertionError("should not be called")
+
+        monkeypatch.setattr(checkpoints.requests, "request", fake_request)
+        assert checkpoints.maybe_upload_artifacts(_task(), out_dir) == []

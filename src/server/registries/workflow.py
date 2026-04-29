@@ -1,0 +1,341 @@
+import json
+from enum import StrEnum
+from typing import Any
+
+from pydantic import BaseModel, Field, field_serializer, field_validator
+
+from ..clients.redis import (
+    WORKFLOWS_SET_KEY,
+    RedisClient,
+    workflow_cancelled_tasks_key,
+    workflow_dispatched_tasks_key,
+    workflow_failed_tasks_key,
+    workflow_key,
+    workflow_tasks_key,
+)
+from ..task.models import TaskRecord, TaskStatus
+from ..utils.time import now_iso
+
+
+class WorkflowStatus(StrEnum):
+    PENDING = "PENDING"
+    DISPATCHED = "DISPATCHED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    DONE = "DONE"
+
+
+TERMINAL_WORKFLOW_STATUSES = frozenset(
+    {WorkflowStatus.FAILED, WorkflowStatus.CANCELLED, WorkflowStatus.DONE}
+)
+
+
+class WorkflowRecord(BaseModel):
+    workflow_id: str = Field(description="Workflow identifier.")
+    task_ids: list[str] = Field(description="Task identifiers in the workflow.")
+    submitted_at: str = Field(
+        default_factory=now_iso, description="Submission timestamp."
+    )
+    updated_at: str = Field(
+        default_factory=now_iso, description="Last update timestamp."
+    )
+
+    @field_serializer("task_ids")
+    def serialize_task_ids(self, task_ids: list[str]) -> str:
+        return json.dumps(task_ids)
+
+    @field_validator("task_ids", mode="before")
+    def deserialize_task_ids(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            return json.loads(v)
+        return v
+
+
+class Workflow(BaseModel):
+    workflow_id: str = Field(description="Workflow identifier.")
+    task_ids: list[str] = Field(description="Task identifiers in the workflow.")
+    submitted_at: str = Field(description="Submission timestamp.")
+    updated_at: str = Field(description="Last update timestamp.")
+    status: WorkflowStatus = Field(description="Workflow status.")
+    dispatched_tasks: list[str] = Field(description="Dispatched task identifiers.")
+    completed_tasks: list[str] = Field(description="Completed task identifiers.")
+    failed_tasks: list[str] = Field(description="Failed task identifiers.")
+    cancelled_tasks: list[str] = Field(description="Cancelled task identifiers.")
+
+
+def _create_workflow_record(
+    workflow_id: str, tasks: list[TaskRecord]
+) -> tuple[WorkflowRecord, list[str], list[str]]:
+    """Return (WorkflowRecord, remaining_task_ids, failed_task_ids)"""
+    task_ids: list[str] = []
+    remaining_tasks: list[str] = []
+    failed_tasks: list[str] = []
+    for task in tasks:
+        task_ids.append(task.task_id)
+        match task.status:
+            case TaskStatus.DONE:
+                continue
+            case TaskStatus.FAILED:
+                failed_tasks.append(task.task_id)
+            case _:
+                remaining_tasks.append(task.task_id)
+    record = WorkflowRecord(workflow_id=workflow_id, task_ids=task_ids)
+    return record, remaining_tasks, failed_tasks
+
+
+def _workflow_update(mapping: dict[str, Any] | None = None) -> dict[str, Any]:
+    if mapping is None:
+        mapping = {}
+    if "updated_at" not in mapping:
+        mapping["updated_at"] = now_iso()
+    return mapping
+
+
+class WorkflowRegistry:
+    def __init__(self, rds: RedisClient) -> None:
+        self._rds = rds
+
+    def register_workflow(self, workflow_id: str, tasks: list[TaskRecord]) -> None:
+        record, remaining_tasks, failed_tasks = _create_workflow_record(
+            workflow_id, tasks
+        )
+        with self._rds.sync.control_pipeline() as pipe:
+            pipe.sadd(WORKFLOWS_SET_KEY, workflow_id)
+            pipe.hset(workflow_key(workflow_id), mapping=record.model_dump())
+            pipe.sadd(workflow_tasks_key(workflow_id), *remaining_tasks)
+            if failed_tasks:
+                pipe.sadd(workflow_failed_tasks_key(workflow_id), *failed_tasks)
+            pipe.execute()
+
+    async def register_workflow_async(
+        self, workflow_id: str, tasks: list[TaskRecord]
+    ) -> None:
+        record, remaining_tasks, failed_tasks = _create_workflow_record(
+            workflow_id, tasks
+        )
+        async with self._rds.asyncio.control_pipeline() as pipe:
+            pipe.sadd(WORKFLOWS_SET_KEY, workflow_id)
+            pipe.hset(workflow_key(workflow_id), mapping=record.model_dump())
+            pipe.sadd(workflow_tasks_key(workflow_id), *remaining_tasks)
+            if failed_tasks:
+                pipe.sadd(workflow_failed_tasks_key(workflow_id), *failed_tasks)
+            await pipe.execute()
+
+    def unregister_workflows(self, *workflow_ids: str) -> None:
+        with self._rds.sync.control_pipeline() as pipe:
+            pipe.srem(WORKFLOWS_SET_KEY, *workflow_ids)
+            pipe.delete(*(workflow_key(wid) for wid in workflow_ids))
+            pipe.delete(*(workflow_tasks_key(wid) for wid in workflow_ids))
+            pipe.delete(*(workflow_dispatched_tasks_key(wid) for wid in workflow_ids))
+            pipe.delete(*(workflow_failed_tasks_key(wid) for wid in workflow_ids))
+            pipe.delete(*(workflow_cancelled_tasks_key(wid) for wid in workflow_ids))
+            pipe.execute()
+
+    async def unregister_workflows_async(self, *workflow_ids: str) -> None:
+        async with self._rds.asyncio.control_pipeline() as pipe:
+            pipe.srem(WORKFLOWS_SET_KEY, *workflow_ids)
+            pipe.delete(*(workflow_key(wid) for wid in workflow_ids))
+            pipe.delete(*(workflow_tasks_key(wid) for wid in workflow_ids))
+            pipe.delete(*(workflow_dispatched_tasks_key(wid) for wid in workflow_ids))
+            pipe.delete(*(workflow_failed_tasks_key(wid) for wid in workflow_ids))
+            pipe.delete(*(workflow_cancelled_tasks_key(wid) for wid in workflow_ids))
+            await pipe.execute()
+
+    def get_workflow_ids(self) -> set[str]:
+        return self._rds.sync.set_members(WORKFLOWS_SET_KEY)
+
+    async def get_workflow_ids_async(self) -> set[str]:
+        return await self._rds.asyncio.set_members(WORKFLOWS_SET_KEY)
+
+    def get_workflow_record(self, workflow_id: str) -> WorkflowRecord | None:
+        data = self._rds.sync.hash_getall(workflow_key(workflow_id))
+        return WorkflowRecord.model_validate(data) if data else None
+
+    async def get_workflow_record_async(
+        self, workflow_id: str
+    ) -> WorkflowRecord | None:
+        data = await self._rds.asyncio.hash_getall(workflow_key(workflow_id))
+        return WorkflowRecord.model_validate(data) if data else None
+
+    def workflow_exists(self, workflow_id: str) -> bool:
+        return self._rds.sync.exists(workflow_key(workflow_id))
+
+    async def workflow_exists_async(self, workflow_id: str) -> bool:
+        return await self._rds.asyncio.exists(workflow_key(workflow_id))
+
+    def get_workflow(self, workflow_id: str) -> Workflow | None:
+        record = self.get_workflow_record(workflow_id)
+        if record is None:
+            return None
+        dispatched_tasks = self._rds.sync.set_members(
+            workflow_dispatched_tasks_key(workflow_id)
+        )
+        failed_tasks = self._rds.sync.set_members(
+            workflow_failed_tasks_key(workflow_id)
+        )
+        cancelled_tasks = self._rds.sync.set_members(
+            workflow_cancelled_tasks_key(workflow_id)
+        )
+        remaining_tasks = self._rds.sync.set_members(workflow_tasks_key(workflow_id))
+        return self._build_workflow(
+            record,
+            dispatched_tasks,
+            failed_tasks,
+            cancelled_tasks,
+            remaining_tasks,
+        )
+
+    async def get_workflow_async(self, workflow_id: str) -> Workflow | None:
+        record = await self.get_workflow_record_async(workflow_id)
+        if record is None:
+            return None
+        dispatched_tasks = await self._rds.asyncio.set_members(
+            workflow_dispatched_tasks_key(workflow_id)
+        )
+        failed_tasks = await self._rds.asyncio.set_members(
+            workflow_failed_tasks_key(workflow_id)
+        )
+        cancelled_tasks = await self._rds.asyncio.set_members(
+            workflow_cancelled_tasks_key(workflow_id)
+        )
+        remaining_tasks = await self._rds.asyncio.set_members(
+            workflow_tasks_key(workflow_id)
+        )
+        return self._build_workflow(
+            record,
+            dispatched_tasks,
+            failed_tasks,
+            cancelled_tasks,
+            remaining_tasks,
+        )
+
+    def update_workflow(self, workflow_id: str, **kwargs: Any) -> None:
+        mapping = _workflow_update(kwargs)
+        self._rds.sync.hash_set(workflow_key(workflow_id), mapping=mapping)
+
+    async def update_workflow_async(self, workflow_id: str, **kwargs: Any) -> None:
+        mapping = _workflow_update(kwargs)
+        await self._rds.asyncio.hash_set(workflow_key(workflow_id), mapping=mapping)
+
+    def mark_task_dispatched(self, workflow_id: str, *task_ids: str) -> None:
+        mapping = _workflow_update()
+        with self._rds.sync.control_pipeline() as pipe:
+            pipe.sadd(workflow_dispatched_tasks_key(workflow_id), *task_ids)
+            pipe.hset(workflow_key(workflow_id), mapping=mapping)
+            pipe.execute()
+
+    async def mark_task_dispatched_async(
+        self, workflow_id: str, *task_ids: str
+    ) -> None:
+        mapping = _workflow_update()
+        async with self._rds.asyncio.control_pipeline() as pipe:
+            pipe.sadd(workflow_dispatched_tasks_key(workflow_id), *task_ids)
+            pipe.hset(workflow_key(workflow_id), mapping=mapping)
+            await pipe.execute()
+
+    def mark_task_done(self, workflow_id: str, *task_ids: str) -> None:
+        mapping = _workflow_update()
+        with self._rds.sync.control_pipeline() as pipe:
+            pipe.srem(workflow_tasks_key(workflow_id), *task_ids)
+            pipe.srem(workflow_dispatched_tasks_key(workflow_id), *task_ids)
+            pipe.hset(workflow_key(workflow_id), mapping=mapping)
+            pipe.execute()
+
+    async def mark_task_done_async(self, workflow_id: str, *task_ids: str) -> None:
+        mapping = _workflow_update()
+        async with self._rds.asyncio.control_pipeline() as pipe:
+            pipe.srem(workflow_tasks_key(workflow_id), *task_ids)
+            pipe.srem(workflow_dispatched_tasks_key(workflow_id), *task_ids)
+            pipe.hset(workflow_key(workflow_id), mapping=mapping)
+            await pipe.execute()
+
+    def mark_task_pending(self, workflow_id: str, *task_ids: str) -> None:
+        mapping = _workflow_update()
+        with self._rds.sync.control_pipeline() as pipe:
+            pipe.srem(workflow_dispatched_tasks_key(workflow_id), *task_ids)
+            pipe.hset(workflow_key(workflow_id), mapping=mapping)
+            pipe.execute()
+
+    async def mark_task_pending_async(self, workflow_id: str, *task_ids: str) -> None:
+        mapping = _workflow_update()
+        async with self._rds.asyncio.control_pipeline() as pipe:
+            pipe.srem(workflow_dispatched_tasks_key(workflow_id), *task_ids)
+            pipe.hset(workflow_key(workflow_id), mapping=mapping)
+            await pipe.execute()
+
+    def mark_task_failed(self, workflow_id: str, *task_ids: str) -> None:
+        mapping = _workflow_update()
+        with self._rds.sync.control_pipeline() as pipe:
+            pipe.srem(workflow_tasks_key(workflow_id), *task_ids)
+            pipe.srem(workflow_dispatched_tasks_key(workflow_id), *task_ids)
+            pipe.sadd(workflow_failed_tasks_key(workflow_id), *task_ids)
+            pipe.hset(workflow_key(workflow_id), mapping=mapping)
+            pipe.execute()
+
+    async def mark_task_failed_async(self, workflow_id: str, *task_ids: str) -> None:
+        mapping = _workflow_update()
+        async with self._rds.asyncio.control_pipeline() as pipe:
+            pipe.srem(workflow_tasks_key(workflow_id), *task_ids)
+            pipe.srem(workflow_dispatched_tasks_key(workflow_id), *task_ids)
+            pipe.sadd(workflow_failed_tasks_key(workflow_id), *task_ids)
+            pipe.hset(workflow_key(workflow_id), mapping=mapping)
+            await pipe.execute()
+
+    def mark_task_cancelled(self, workflow_id: str, *task_ids: str) -> None:
+        mapping = _workflow_update()
+        with self._rds.sync.control_pipeline() as pipe:
+            pipe.srem(workflow_tasks_key(workflow_id), *task_ids)
+            pipe.srem(workflow_dispatched_tasks_key(workflow_id), *task_ids)
+            pipe.sadd(workflow_cancelled_tasks_key(workflow_id), *task_ids)
+            pipe.hset(workflow_key(workflow_id), mapping=mapping)
+            pipe.execute()
+
+    async def mark_task_cancelled_async(self, workflow_id: str, *task_ids: str) -> None:
+        mapping = _workflow_update()
+        async with self._rds.asyncio.control_pipeline() as pipe:
+            pipe.srem(workflow_tasks_key(workflow_id), *task_ids)
+            pipe.srem(workflow_dispatched_tasks_key(workflow_id), *task_ids)
+            pipe.sadd(workflow_cancelled_tasks_key(workflow_id), *task_ids)
+            pipe.hset(workflow_key(workflow_id), mapping=mapping)
+            await pipe.execute()
+
+    def get_remaining_tasks(self, workflow_id: str) -> set[str]:
+        return self._rds.sync.set_members(workflow_tasks_key(workflow_id))
+
+    async def get_remaining_tasks_async(self, workflow_id: str) -> set[str]:
+        return await self._rds.asyncio.set_members(workflow_tasks_key(workflow_id))
+
+    def _build_workflow(
+        self,
+        record: WorkflowRecord,
+        dispatched_tasks: set[str],
+        failed_tasks: set[str],
+        cancelled_tasks: set[str],
+        remaining_tasks: set[str],
+    ) -> Workflow:
+        active_dispatched = dispatched_tasks.intersection(remaining_tasks)
+        if failed_tasks:
+            status = WorkflowStatus.FAILED
+        elif remaining_tasks:
+            if active_dispatched:
+                status = WorkflowStatus.DISPATCHED
+            else:
+                status = WorkflowStatus.PENDING
+        elif cancelled_tasks:
+            status = WorkflowStatus.CANCELLED
+        else:
+            status = WorkflowStatus.DONE
+        completed_tasks = (
+            set(record.task_ids) - remaining_tasks - failed_tasks - cancelled_tasks
+        )
+        return Workflow(
+            workflow_id=record.workflow_id,
+            task_ids=record.task_ids,
+            submitted_at=record.submitted_at,
+            updated_at=record.updated_at,
+            status=status,
+            dispatched_tasks=list(active_dispatched),
+            completed_tasks=list(completed_tasks),
+            failed_tasks=list(failed_tasks),
+            cancelled_tasks=list(cancelled_tasks),
+        )

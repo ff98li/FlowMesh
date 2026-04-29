@@ -1,0 +1,175 @@
+import json
+import logging
+import threading
+from collections.abc import Callable
+
+import httpx
+
+from shared.schemas.node import NodeInfo
+from shared.utils.time import now_iso
+
+from ...clients.redis import NODE_EVENT_CHANNEL, SyncRedisClient
+from ...config import NodeRole
+from ...registries.node import NodeRegistry
+
+
+class Lifecycle:
+    """Manages node registration, heartbeats, and unregistration."""
+
+    def __init__(
+        self,
+        redis: SyncRedisClient,
+        node_registry: NodeRegistry,
+        node_info: NodeInfo,
+        role: NodeRole,
+        base_url: str,
+        hb_sec: int,
+        hb_ttl_sec: int,
+        logger: logging.Logger,
+        current_gpu_count_getter: Callable[[], int] | None = None,
+    ) -> None:
+        self._redis = redis
+        self._node_registry = node_registry
+        self._node_info = node_info
+        self._role = role
+        self._base_url = base_url
+        self.hb_sec = hb_sec
+        self.hb_ttl_sec = hb_ttl_sec
+        self.logger = logger
+        self._current_gpu_count_getter = current_gpu_count_getter
+
+        self._node_id: str | None = None
+        self._stop_event = threading.Event()
+        self._stop_event.set()  # Initially stopped
+        self._hb_thread: threading.Thread | None = None
+        self._hb_lock = threading.Lock()
+
+    @property
+    def node_id(self) -> str:
+        """Return the assigned node_id. Only valid after ``start()``."""
+        if self._node_id is None:
+            raise RuntimeError("Lifecycle not started; node_id not yet assigned")
+        return self._node_id
+
+    # ------------------------------------------------------------------ #
+    # Registration
+    # ------------------------------------------------------------------ #
+
+    def _register(self) -> str:
+        """Register with the root and return the assigned node_id."""
+        if self._role is NodeRole.ROOT:
+            return self._register_direct()
+        return self._register_http()
+
+    def _register_direct(self) -> str:
+        """Root node: register directly via NodeRegistry (Redis)."""
+        node_id = self._node_registry.register_node(self._node_info)
+        self.logger.info("Node registered (direct): %s", node_id)
+        return node_id
+
+    def _register_http(self) -> str:
+        """Worker node: register via HTTP on the root node."""
+        url = f"{self._base_url.rstrip('/')}/api/v1/nodes/register"
+        self.logger.info(
+            "Registering node %s with root at %s", self._node_info.alias, url
+        )
+        payload = self._node_info.model_dump()
+        resp = httpx.post(url, json=payload, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+        node_id = data.get("node_id")
+        if not node_id:
+            raise RuntimeError("Node registration failed: missing node_id")
+        self.logger.info("Node registered (HTTP): %s", node_id)
+        return node_id
+
+    # ------------------------------------------------------------------ #
+    # Event publishing
+    # ------------------------------------------------------------------ #
+
+    def _publish_event(self, event_type: str, **extra: object) -> None:
+        payload = {
+            "type": event_type,
+            "node_id": self._node_id,
+            "ts": now_iso(),
+            "tags": [],
+            "payload": {},
+            **extra,
+        }
+        self._redis.publish_telemetry(NODE_EVENT_CHANNEL, json.dumps(payload))
+
+    def _current_gpu_count(self) -> int | None:
+        getter = self._current_gpu_count_getter
+        if getter is None:
+            return None
+        try:
+            return max(0, int(getter()))
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to determine current GPU count for node %s: %s",
+                self._node_id,
+                exc,
+            )
+            return None
+
+    def heartbeat_now(self) -> None:
+        with self._hb_lock:
+            ts = now_iso()
+            self._node_registry.update_node_hb(
+                self.node_id,
+                ts,
+                self.hb_ttl_sec,
+                current_gpu_count=self._current_gpu_count(),
+            )
+            gpu_count = self._current_gpu_count()
+            hb_payload: dict[str, object] = {"ttl_sec": self.hb_ttl_sec}
+            if gpu_count is not None:
+                hb_payload["current_gpu_count"] = gpu_count
+            self._publish_event("SV_HEARTBEAT", payload=hb_payload)
+
+    def start(self) -> str:
+        if self._hb_thread is not None:
+            self.logger.warning("Node lifecycle already started")
+            return self.node_id
+
+        self._node_id = self._register()
+        self._publish_event("SV_REGISTER")
+        self.heartbeat_now()
+
+        self._stop_event.clear()
+        self._hb_thread = threading.Thread(
+            target=self._hb_loop,
+            name=f"NodeLifecycle[{self._node_id}]",
+            daemon=True,
+        )
+        self._hb_thread.start()
+        return self._node_id
+
+    def _hb_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.heartbeat_now()
+            except Exception as exc:
+                self.logger.warning(
+                    "Node heartbeat failed for %s: %s", self._node_id, exc
+                )
+            self._stop_event.wait(self.hb_sec)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+        if self._hb_thread is not None:
+            self._hb_thread.join()
+            self._hb_thread = None
+
+        try:
+            self._publish_event("SV_UNREGISTER")
+        finally:
+            try:
+                self._node_registry.unregister_node(self.node_id)
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to unregister node %s during shutdown: %s",
+                    self._node_id,
+                    exc,
+                )

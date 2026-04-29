@@ -1,0 +1,7 @@
+provider: vastai
+init_on_start: true
+worker_config:
+  worker_alias: vastai_gpu_worker
+  specs:
+    gpu_name: "=H100_NVL"
+  disk: 64

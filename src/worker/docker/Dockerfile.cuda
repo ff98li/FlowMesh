@@ -1,0 +1,95 @@
+ARG TZ=Asia/Singapore
+ARG CUDA_VERSION=12.9.1
+ARG UBUNTU_VERSION=24.04
+ARG TORCH_CUDA_ARCH_LIST='7.0 7.5 8.0 8.9 9.0 10.0 12.0'
+
+# Builder stage keeps development-only CUDA bits
+FROM builder AS build_context
+
+# Runtime stage pulls only the CUDA runtime bits
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+LABEL org.opencontainers.image.title="FlowMesh Worker (CUDA)" \
+      org.opencontainers.image.description="GPU-enabled FlowMesh worker runtime" \
+      org.opencontainers.image.source="https://github.com/mlsys-io/FlowMesh" \
+      org.opencontainers.image.url="https://github.com/mlsys-io/FlowMesh"
+ARG TZ
+ARG CUDA_VERSION
+ARG TORCH_CUDA_ARCH_LIST
+ENV TZ=${TZ} \
+    DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_TORCH_BACKEND=cu129 \
+    UV_HTTP_TIMEOUT=500 \
+    UV_INDEX_STRATEGY="unsafe-best-match" \
+    UV_LINK_MODE=copy \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+ && echo $TZ > /etc/timezone \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl git gnupg2 software-properties-common tini tzdata \
+      libnuma1 libibverbs1 \
+ && dpkg-reconfigure -f noninteractive tzdata \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install Python 3.12 via deadsnakes PPA in runtime image
+RUN add-apt-repository ppa:deadsnakes/ppa -y \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3.12 python3.12-venv python3.12-dev python3-pip \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/
+
+# Copy FlashInfer CUDA files and Python venv from builder
+COPY --from=build_context /usr/local/cuda/include /usr/local/cuda/include
+COPY --from=build_context /opt/py312 /opt/py312
+ENV PATH=/opt/py312/bin:$PATH
+
+# Install Python dependencies (CPU + GPU stacks)
+COPY src/worker/requirements/requirements.txt /tmp/requirements.txt
+RUN uv pip install --python /opt/py312/bin/python --system --requirement /tmp/requirements.txt \
+ && rm -f /tmp/requirements.txt
+
+# Non-root runtime user + HF cache
+RUN useradd -m -u 10001 appuser \
+ && mkdir -p /home/appuser/.cache/huggingface \
+ && chown -R appuser:appuser /home/appuser/.cache
+
+WORKDIR /app
+
+# Application code
+COPY src/worker ./worker
+COPY src/shared ./shared
+
+# Default worker env knobs
+ENV SUPERVISOR_GRPC_TARGET=flowmesh_server:50051 \
+    RESULTS_DIR=/app/worker/results \
+    LOG_LEVEL=INFO \
+    HEARTBEAT_INTERVAL_SEC=30 \
+    HF_HOME=/home/appuser/.cache/huggingface
+
+# Permissions and writable dir
+RUN chmod +x /app/worker/entrypoint.sh \
+ && mkdir -p /app/worker/results \
+ && chown -R appuser:appuser /app
+
+USER appuser
+
+ENV PYTHONPATH=/app
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["python", "-m", "worker.healthcheck"]
+
+ARG BUILD_VERSION=dev
+ARG BUILD_REF=local
+ARG BUILD_CREATED=unknown
+LABEL org.opencontainers.image.version="${BUILD_VERSION}" \
+      org.opencontainers.image.created="${BUILD_CREATED}" \
+      org.opencontainers.image.revision="${BUILD_REF}"
+
+# Use tini as PID 1; run with --gpus all on GPU hosts
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/app/worker/entrypoint.sh"]

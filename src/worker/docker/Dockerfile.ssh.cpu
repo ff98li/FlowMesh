@@ -1,0 +1,42 @@
+# Minimal SSH session image for FlowMesh SSH tasks.
+#
+# The entrypoint reads the following env vars at container startup:
+#   SSH_USER          - login username to create (default: flowmesh)
+#   AUTHORIZED_KEYS   - newline-separated list of SSH public keys
+#
+# Any additional env vars set by the executor are available to the session.
+FROM debian:bookworm-slim
+
+LABEL org.opencontainers.image.title="FlowMesh SSH Session" \
+      org.opencontainers.image.description="Ephemeral SSH session container for FlowMesh SSH tasks" \
+      org.opencontainers.image.source="https://github.com/mlsys-io/FlowMesh" \
+      org.opencontainers.image.url="https://github.com/mlsys-io/FlowMesh"
+
+ARG TZ=UTC
+ENV TZ=${TZ} \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+ && echo $TZ > /etc/timezone \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      openssh-server \
+      tini \
+      tzdata \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /var/run/sshd /etc/ssh/sshd_config.d
+
+COPY src/worker/docker/ssh-session.sh /flowmesh-ssh-session.sh
+COPY src/worker/docker/ssh-run.sh /flowmesh-ssh-run.sh
+RUN chmod +x /flowmesh-ssh-session.sh /flowmesh-ssh-run.sh
+
+EXPOSE 22
+
+ARG BUILD_VERSION=dev
+ARG BUILD_REF=local
+ARG BUILD_CREATED=unknown
+LABEL org.opencontainers.image.version="${BUILD_VERSION}" \
+      org.opencontainers.image.created="${BUILD_CREATED}" \
+      org.opencontainers.image.revision="${BUILD_REF}"
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/flowmesh-ssh-session.sh"]

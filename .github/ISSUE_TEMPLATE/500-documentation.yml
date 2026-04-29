@@ -1,0 +1,33 @@
+name: Documentation
+description: Report a documentation issue or suggest improvements.
+title: "[Doc]: "
+labels: ["documentation"]
+
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Before submitting, please search
+        [existing issues](https://github.com/mlsys-io/FlowMesh/issues?q=is%3Aissue+sort%3Acreated-desc+)
+        to avoid duplicates.
+
+  - type: textarea
+    attributes:
+      label: Describe the issue
+      description: >
+        What is missing, incorrect, or unclear in the documentation?
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Suggested fix
+      description: >
+        How could the documentation be improved?
+
+  - type: checkboxes
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have searched existing issues and confirmed this is not a duplicate.
+          required: true

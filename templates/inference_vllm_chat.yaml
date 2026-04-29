@@ -1,0 +1,53 @@
+apiVersion: flowmesh/v1
+kind: InferenceTask
+metadata:
+  name: inference-vllm-chat
+  owner: alice
+  annotations:
+    description: "Run chat-style inference using vLLM (TinyLlama-1.1B-Chat) on a list of multi-turn conversations."
+
+spec:
+  taskType: "inference"
+
+  resources:
+    replicas: 1
+    hardware:
+      cpu: "8"
+      memory: "32Gi"
+      gpu:
+        type: "any"
+        count: 1
+
+  model:
+    source:
+      type: "huggingface"
+      identifier: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+      revision: "main"
+    vllm:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.5
+      trust_remote_code: true
+
+  data:
+    type: "list"
+    items:
+      - - role: system
+          content: "You are a terse assistant. Answer in one sentence."
+        - role: user
+          content: "What is the capital of France?"
+      - - role: system
+          content: "You are a terse assistant. Answer in one sentence."
+        - role: user
+          content: "Name one programming language created in the 1970s."
+
+  inference:
+    max_tokens: 64
+    temperature: 0.0
+
+  output:
+    destination:
+      type: "local"
+      path: "./inference_vllm_chat"
+    artifacts:
+      - "results.json"
+      - "logs"

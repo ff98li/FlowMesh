@@ -1,0 +1,92 @@
+# conditional_echo_test.yaml
+#
+# E2E smoke test for conditional task execution using the EchoExecutor
+# (CPU-only, no GPU or external services required).
+#
+# Graph:
+#   echo-upstream   — emits the string "skip-me" (simulates a judge verdict)
+#   echo-conditional — CONDITIONAL on echo-upstream.result.items.0.output == "run-me"
+#                      Since the upstream emits "skip-me", this node should be
+#                      skipped (marked DONE without dispatch).
+#   echo-always     — depends on both; always runs and reads upstream output
+#
+# Expected behaviour:
+#   echo-upstream    → DONE  (output: "skip-me")
+#   echo-conditional → DONE  (skipped by host, result.metadata.skipped == true)
+#   echo-always      → DONE  (output: "skip-me")
+
+apiVersion: flowmesh/v1
+kind: EchoTask
+metadata:
+  name: conditional-echo-test
+  annotations:
+    description: >
+      Smoke test for conditional task execution.
+      echo-conditional should be skipped by the host because
+      the upstream verdict does not equal the condition value.
+
+spec:
+  taskType: "echo"
+
+  resources:
+    replicas: 1
+    hardware:
+      cpu: "1"
+      memory: "256Mi"
+
+  graph:
+    nodes:
+      # --- Node 1: emits the "verdict" ---
+      - name: echo-upstream
+        spec:
+          taskType: "echo"
+          resources:
+            hardware:
+              cpu: "1"
+              memory: "256Mi"
+          data:
+            type: "list"
+            items:
+              - "skip-me"
+
+      # --- Node 2: CONDITIONAL — only run when upstream says "run-me" ---
+      # Since upstream says "skip-me", this should be skipped by the host.
+      - name: echo-conditional
+        dependsOn: ["echo-upstream"]
+        spec:
+          taskType: "echo"
+          resources:
+            hardware:
+              cpu: "1"
+              memory: "256Mi"
+          condition:
+            node: "echo-upstream"
+            field: "result.items.0.output"
+            equals: "run-me"
+          # Note: condition.field uses _dig_path (dot-separated, int coercion)
+          # while data.items path uses _evaluate_expr (bracket notation)
+          data:
+            type: "list"
+            items:
+              - "this-should-not-appear"
+
+      # --- Node 3: always runs, reads upstream output ---
+      - name: echo-always
+        dependsOn: ["echo-upstream", "echo-conditional"]
+        spec:
+          taskType: "echo"
+          resources:
+            hardware:
+              cpu: "1"
+              memory: "256Mi"
+          data:
+            type: "list"
+            items:
+              - node: "echo-upstream"
+                path: "result.items[0].output"
+
+  output:
+    destination:
+      type: "http"
+    artifacts:
+      - "results.json"

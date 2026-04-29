@@ -1,0 +1,28 @@
+name: Unit Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --all-extras --frozen
+
+      - name: Run unit tests
+        # Skip the multiprocessing GPU-cleanup test — it requires a real CUDA
+        # device and isolated processes.
+        run: >
+          uv run pytest tests/
+          --ignore=tests/worker/test_mp_executor_cleanup_gpu.py
+          -v

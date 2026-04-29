@@ -1,0 +1,47 @@
+apiVersion: flowmesh/v1
+kind: DiffusersTask
+metadata:
+  name: diffusers-text-to-image
+
+spec:
+  taskType: "diffusion"
+
+  resources:
+    replicas: 1
+    hardware:
+      cpu: "4"
+      memory: "16Gi"
+      gpu:
+        count: 1
+        type: "any"
+
+  model:
+    source:
+      type: "huggingface"
+      identifier: "stabilityai/stable-diffusion-3.5-large"
+    diffusers:
+      dtype: "bf16"
+      use_safetensors: true
+
+  inference:
+    num_inference_steps: 30
+    guidance_scale: 7.5
+    height: 512
+    width: 512
+    system_prompt: "High quality, photorealistic, 8k resolution"
+    negative_prompt: "low quality, blurry, deformed"
+    num_images_per_prompt: 1
+    seed: 42
+
+  data:
+    type: "list"
+    items:
+      - "A futuristic city with flying cars at night"
+      - "A serene mountain lake reflecting the sunset"
+
+  output:
+    destination:
+      type: "http"
+    artifacts:
+      - "results.json"
+      - "images/"

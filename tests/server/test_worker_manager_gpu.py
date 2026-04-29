@@ -1,0 +1,134 @@
+"""Tests for server GPU resource management and worker capacity reporting."""
+
+import asyncio
+import logging
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from server.supervisor.manager import WorkerInitConfig, WorkerManager
+from server.supervisor.resource_manager import GpuArch, MachineEnv, ResourceManager
+
+# ------------------------------------------------------------------ #
+# Helpers
+# ------------------------------------------------------------------ #
+
+
+def _resource_manager(available: set[int]) -> ResourceManager:
+    """Build a ResourceManager with a fixed set of available GPU indices."""
+    rm = object.__new__(ResourceManager)
+    rm._env = MachineEnv(
+        cpu_count=16,
+        gpu_families={i: GpuArch.UNKNOWN for i in available},
+        available_gpus=set(available),
+    )
+    return rm
+
+
+def _worker_manager() -> WorkerManager:
+    """Construct a WorkerManager in started state without filesystem or Docker."""
+    wm = object.__new__(WorkerManager)
+    wm.config_path = "/dev/null"
+    wm.logger = logging.getLogger("test-wm")
+    wm._registry = MagicMock()
+    wm._is_started = True
+    wm._default_worker_config = {}
+    wm._capacity_change_callback = None
+    return wm
+
+
+# ------------------------------------------------------------------ #
+# ResourceManager.next_available_gpus
+# ------------------------------------------------------------------ #
+
+
+class TestNextAvailableGpus:
+    def test_single_gpu_returns_lowest_index(self) -> None:
+        rm = _resource_manager({0, 1, 2, 3})
+        assert rm.next_available_gpus(1) == [0]
+
+    def test_single_gpu_picks_minimum_when_indices_nonzero(self) -> None:
+        rm = _resource_manager({2, 3})
+        assert rm.next_available_gpus(1) == [2]
+
+    def test_two_gpus_returns_two_lowest_sorted(self) -> None:
+        rm = _resource_manager({0, 1, 2, 3})
+        assert rm.next_available_gpus(2) == [0, 1]
+
+    def test_two_gpus_sparse_indices(self) -> None:
+        rm = _resource_manager({1, 3})
+        assert rm.next_available_gpus(2) == [1, 3]
+
+    def test_four_gpus_returns_all_sorted(self) -> None:
+        rm = _resource_manager({0, 1, 2, 3})
+        assert rm.next_available_gpus(4) == [0, 1, 2, 3]
+
+    def test_requesting_more_than_available_raises(self) -> None:
+        rm = _resource_manager({0, 1})
+        with pytest.raises(ValueError, match="Not enough available GPUs"):
+            rm.next_available_gpus(3)
+
+    def test_zero_raises(self) -> None:
+        rm = _resource_manager({0, 1})
+        with pytest.raises(ValueError, match="Invalid number of GPUs"):
+            rm.next_available_gpus(0)
+
+    def test_negative_raises(self) -> None:
+        rm = _resource_manager({0, 1})
+        with pytest.raises(ValueError, match="Invalid number of GPUs"):
+            rm.next_available_gpus(-1)
+
+
+class TestAvailableGpuCount:
+    def test_four_gpus(self) -> None:
+        assert _resource_manager({0, 1, 2, 3}).available_gpu_count == 4
+
+    def test_two_gpus(self) -> None:
+        assert _resource_manager({0, 1}).available_gpu_count == 2
+
+    def test_no_gpus(self) -> None:
+        assert _resource_manager(set()).available_gpu_count == 0
+
+
+class TestCapacityChangeReporting:
+    def _run(self, coro: object) -> object:  # type: ignore[return]
+        return asyncio.run(coro)  # type: ignore[arg-type]
+
+    def test_create_worker_reports_capacity_change(self) -> None:
+        wm = _worker_manager()
+        callback = MagicMock()
+        wm._capacity_change_callback = callback
+
+        worker = MagicMock()
+        info = MagicMock()
+        worker.name = "w-1"
+        worker.get_info.return_value = info
+        wm._create_worker = MagicMock(return_value=worker)  # type: ignore[method-assign]
+        wm._start_worker = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        result = self._run(
+            wm.create_worker(
+                WorkerInitConfig(
+                    provider="docker", init_on_start=True, worker_config={}
+                )
+            )
+        )
+
+        assert result is info
+        callback.assert_called_once_with()
+
+    def test_destroy_worker_reports_capacity_change(self) -> None:
+        wm = _worker_manager()
+        callback = MagicMock()
+        wm._capacity_change_callback = callback
+
+        worker = MagicMock()
+        worker.name = "w-1"
+        wm._registry.try_get_by_name.return_value = worker  # type: ignore[attr-defined]
+        wm._registry.try_pop_by_name = MagicMock()  # type: ignore[attr-defined, method-assign]
+        wm._stop_and_destroy_worker = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        result = self._run(wm.destroy_worker("w-1"))
+
+        assert result is True
+        callback.assert_called_once_with()

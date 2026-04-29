@@ -1,0 +1,328 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "promptType": "define",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.8,
+      "position": [
+        -432,
+        48
+      ],
+      "id": "996bd017-7a4c-4140-8482-51ea6ada1174",
+      "name": "SFT",
+      "notesInFlow": false,
+      "notes": "{\"taskType\": \"sft\"}"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"dataset_name\": \"openai/gsm8k\",\n  \"config_name\": \"main\",\n  \"split\": \"train[:1%]\",\n  \"prompt_column\": \"question\",\n  \"response_column\": \"answer\",\n  \"separator\": \"\\n\\nAnswer: \",\n  \"max_samples\": 200\n}",
+        "options": {
+          "dotNotation": false
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -592,
+        48
+      ],
+      "id": "d1d13b4c-858c-4f9f-8438-2c4cdcd01724",
+      "name": "Data"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"replicas\": 1,\n  \"hardware\": {\n    \"cpu\": \"8\",\n    \"memory\": \"10Gi\",\n    \"gpu\": {\n      \"type\": \"any\",\n      \"count\": 1\n    }\n  }\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -288,
+        -96
+      ],
+      "id": "5935f710-c839-487a-b72d-7463b3dd68e9",
+      "name": "Resource Spec SFT"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"num_train_epochs\": 1,\n  \"batch_size\": 1,\n  \"gradient_accumulation_steps\": 4,\n  \"learning_rate\": 0.00005,\n  \"max_seq_length\": 256,\n  \"logging_steps\": 10,\n  \"save_steps\": 500,\n  \"save_model\": true,\n  \"gradient_checkpointing\": true,\n  \"packing\": false,\n  \"auto_deepspeed_stage\": 2\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -448,
+        -96
+      ],
+      "id": "eda3a2f0-31d4-4ff0-a629-57ea6e30edce",
+      "name": "Training Spec SFT"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"path\": \"result.final_model.path\",\n  \"task_id\": \"result.task_id\",\n  \"archive\": \"result.final_model_archive.path\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -96,
+        48
+      ],
+      "id": "1dcd6c3a-6fb3-4d2d-bbea-53113e902349",
+      "name": "Checkpoint Spec"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"type\": \"dataset\",\n  \"url\": \"openai/gsm8k\",\n  \"name\": \"main\",\n  \"split\": \"train[:200]\",\n  \"column\": \"question\",\n  \"shuffle\": true,\n  \"seed\": 11\n}",
+        "options": {
+          "dotNotation": false
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -112,
+        208
+      ],
+      "id": "5fcdcc4c-ef8c-4557-8856-63bc828af88f",
+      "name": "Input"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "Use the fine-tuned tutor style to answer factually and explicitly mark uncertainty when unsure.",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.8,
+      "position": [
+        80,
+        208
+      ],
+      "id": "7d0f5eb4-04e8-4caa-bd36-78a195d986d1",
+      "name": "Inference",
+      "notes": "{\"taskType\": \"inference\"}"
+    },
+    {
+      "parameters": {
+        "model": "Qwen/Qwen3-0.6B",
+        "options": {
+          "maxTokens": 192,
+          "temperature": 0.2,
+          "topK": 1,
+          "topP": 0.9
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmOpenHuggingFaceInference",
+      "typeVersion": 1,
+      "position": [
+        80,
+        368
+      ],
+      "id": "59d72b15-6bda-4573-b8d1-b05a8c9df6a6",
+      "name": "Model Spec I",
+      "credentials": {
+        "huggingFaceApi": {
+          "id": "6sYYklxINZZKBkrv",
+          "name": "HuggingFaceApi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "Qwen/Qwen3-0.6B",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmOpenHuggingFaceInference",
+      "typeVersion": 1,
+      "position": [
+        -432,
+        208
+      ],
+      "id": "6cba783d-f87e-4baf-9841-2d0af74dc413",
+      "name": "Model Spec S",
+      "credentials": {
+        "huggingFaceApi": {
+          "id": "6sYYklxINZZKBkrv",
+          "name": "HuggingFaceApi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"gpu_memory_utilization\": 0.9\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        64,
+        64
+      ],
+      "id": "4d940a8c-7d8e-4308-bf08-bcc415dce8ed",
+      "name": "Runtime Spec I"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"replicas\": 1,\n  \"hardware\": {\n    \"cpu\": \"8\",\n    \"memory\": \"10Gi\",\n    \"gpu\": {\n      \"type\": \"any\",\n      \"count\": 1\n    }\n  }\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        224,
+        64
+      ],
+      "id": "31835cd4-be3d-4c46-a80c-72b57b6ecc77",
+      "name": "Resource Spec I"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -752,
+        48
+      ],
+      "id": "7b243e1b-6b78-4f93-9ebe-f3863e127ec6",
+      "name": "When clicking ‘Execute workflow’"
+    }
+  ],
+  "connections": {
+    "SFT": {
+      "main": [
+        [
+          {
+            "node": "Checkpoint Spec",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Data": {
+      "main": [
+        [
+          {
+            "node": "SFT",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resource Spec SFT": {
+      "main": [
+        [
+          {
+            "node": "SFT",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Training Spec SFT": {
+      "main": [
+        [
+          {
+            "node": "SFT",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Checkpoint Spec": {
+      "main": [
+        [
+          {
+            "node": "Inference",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input": {
+      "main": [
+        [
+          {
+            "node": "Inference",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Model Spec I": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Inference",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Model Spec S": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "SFT",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Runtime Spec I": {
+      "main": [
+        [
+          {
+            "node": "Inference",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resource Spec I": {
+      "main": [
+        [
+          {
+            "node": "Inference",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "45ca4c6175abf8c77a853b8cc598f4fd94a62d85f750a16a9d4bc2a929fa004b"
+  }
+}

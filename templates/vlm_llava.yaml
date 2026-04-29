@@ -1,0 +1,78 @@
+apiVersion: flowmesh/v1
+kind: InferenceTask
+metadata:
+  name: vlm-embedding-inference-test
+
+spec:
+  taskType: "inference"
+
+  resources:
+    replicas: 1
+    hardware:
+      cpu: "8"
+      memory: "24Gi"
+      gpu:
+        count: 1
+        type: "any"
+
+  graph:
+    nodes:
+      - name: image-embedding
+        spec:
+          taskType: embedding
+          
+          model:
+            source:
+              identifier: llava-hf/llava-1.5-7b-hf
+            transformers:
+              mode: visual-embedding
+              trust_remote_code: true
+
+          data:
+            type: list
+            items:
+              - https://images.unsplash.com/photo-1617298452285-ceb241df5c67?w=1920
+          output:
+            destination:
+              type: http
+              timeoutSec: 1800
+            artifacts:
+              - results.json
+              - visual_embeddings.pt
+
+      - name: vlm-inference
+        dependsOn: ["image-embedding"]
+        spec:
+          taskType: inference
+          
+          model:
+            source:
+              identifier: llava-hf/llava-1.5-7b-hf
+            vllm:
+              trust_remote_code: true
+              enable_mm_embeds: true
+              limit_mm_per_prompt:
+                image: 1
+
+          data:
+            type: graph_template
+            template:
+              name: format
+              options:
+                format:
+                  messages:
+                  - role: user
+                    content: Describe the content of the menu shown in the image. Which one would you suggest?
+            image_embedding: 
+              node: image-embedding
+              path: result.embedding_file
+
+          inference:
+            max_tokens: 512
+            temperature: 0.1
+
+          output:
+            destination:
+              type: http
+            artifacts:
+              - results.json

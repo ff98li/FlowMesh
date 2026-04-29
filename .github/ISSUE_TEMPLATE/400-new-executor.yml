@@ -1,0 +1,70 @@
+name: New executor / task type
+description: Request support for a new executor or task type.
+title: "[Executor]: "
+labels: ["executor", "feature request"]
+
+body:
+  - type: markdown
+    attributes:
+      value: >
+        FlowMesh currently supports 14 task types: inference, diffusion, rag,
+        agent, sft, lora_sft, ppo, dpo, echo, data_profiling, data_retrieval,
+        embedding, api, ssh.
+
+  - type: textarea
+    attributes:
+      label: Executor / task type
+      description: >
+        Name of the proposed executor or task type and the framework or library
+        it wraps (e.g., "TensorRT-LLM inference executor").
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Motivation
+      description: >
+        What use case does this enable? Why can't an existing executor cover it?
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Expected input / output
+      description: >
+        Describe the task spec fields, model source, data format, and expected
+        result structure. A sample workflow YAML snippet is helpful.
+      placeholder: |
+        ```yaml
+        spec:
+          taskType: my_new_type
+          model:
+            source:
+              type: ...
+          data:
+            ...
+        ```
+
+  - type: dropdown
+    id: gpu
+    attributes:
+      label: GPU required?
+      options:
+        - "Yes"
+        - "No"
+        - Depends on config
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: >
+        Links to the framework, related papers, or existing implementations.
+
+  - type: checkboxes
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have searched existing issues and confirmed this is not a duplicate.
+          required: true

@@ -1,0 +1,305 @@
+"""Omni executor for narration/speech generation via Qwen3-Omni."""
+
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+try:
+    from vllm import SamplingParams
+
+    _HAS_VLLM = True
+except Exception:
+    if TYPE_CHECKING:
+        from vllm import SamplingParams
+    else:
+        SamplingParams = None
+    _HAS_VLLM = False
+
+try:
+    from vllm_omni.entrypoints.omni import Omni
+
+    _HAS_OMNI = True
+except Exception:
+    if TYPE_CHECKING:
+        from vllm_omni.entrypoints.omni import Omni
+    else:
+        Omni = None
+    _HAS_OMNI = False
+
+from shared.tasks.specs.omni import OmniText2GeneralSpecStrict
+from shared.utils.parsing import as_list, to_bool, to_float, to_int, to_int_list
+
+from .base_executor import ExecutionError, ExecutorTask
+from .omni_executor_base import OmniExecutorBase, extract_audio_from_mm, save_audio
+from .utils.checkpoints import artifact_ref, maybe_upload_artifacts
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_SYSTEM_PROMPT = (
+    "You are Qwen, a virtual human developed by the Qwen Team, "
+    "Alibaba Group, capable of perceiving auditory and visual inputs, "
+    "as well as generating text and speech."
+)
+
+
+class OmniText2GeneralExecutor(OmniExecutorBase):
+    """Generate narration/speech audio using Qwen3-Omni through vllm_omni.Omni."""
+
+    name = "omni_text2general"
+
+    def prepare(self) -> None:
+        if not _HAS_OMNI:
+            raise ExecutionError(
+                "vllm_omni is not installed; cannot use omni_text2general executor."
+            )
+        if not _HAS_VLLM:
+            raise ExecutionError(
+                "vllm is not installed; "
+                "omni_text2general requires SamplingParams from vllm."
+            )
+
+    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
+        spec = self.require_spec(task, OmniText2GeneralSpecStrict)
+        spec_dict = spec.model_dump(by_alias=True)
+        out_dir = Path(out_dir).resolve()
+
+        texts = self.collect_text_inputs(spec_dict)
+        if not texts:
+            raise ExecutionError(
+                "omni_text2general requires text input "
+                "in spec.data.text or spec.data.items."
+            )
+
+        cfg = _narration_cfg(spec_dict)
+        output_format = str(cfg.get("output_format") or "wav").strip().lower() or "wav"
+        if output_format != "wav":
+            raise ExecutionError(
+                "omni_text2general currently supports output_format='wav' only."
+            )
+        sample_rate = to_int(cfg.get("sample_rate"), default=24000)
+        output_modalities = _parse_modalities(cfg.get("modalities"))
+        py_generator = to_bool(cfg.get("py_generator"), default=False)
+
+        self._ensure_omni(spec_dict)
+        if self._omni is None:
+            raise ExecutionError("Omni model failed to initialize.")
+
+        prompts = [
+            {
+                "prompt": self._build_prompt(text, spec_dict=spec_dict),
+                "modalities": output_modalities,
+            }
+            for text in texts
+        ]
+        sampling_params = _build_sampling_params(cfg)
+
+        try:
+            generator = self._omni.generate(
+                prompts, sampling_params, py_generator=py_generator
+            )
+        except Exception as exc:
+            raise ExecutionError(
+                f"omni_text2general generation failed to start: {exc}"
+            ) from exc
+
+        audio_results: list[dict[str, Any]] = []
+        text_results: dict[str, str] = {}
+        for stage_outputs in generator:
+            final_type = (
+                str(getattr(stage_outputs, "final_output_type", "")).strip().lower()
+            )
+            request_outputs = as_list(getattr(stage_outputs, "request_output", None))
+            if not request_outputs:
+                continue
+            if final_type == "text":
+                for req in request_outputs:
+                    rid = _request_id(req, default_index=len(text_results) + 1)
+                    text_out = _extract_text_output(req)
+                    if text_out is not None:
+                        text_results[rid] = text_out
+                continue
+            if final_type == "audio":
+                for req in request_outputs:
+                    rid = _request_id(req, default_index=len(audio_results) + 1)
+                    audio_obj = _extract_request_audio(req)
+                    if audio_obj is not None:
+                        audio_results.append({"request_id": rid, "audio": audio_obj})
+
+        if not audio_results:
+            raise ExecutionError(
+                "omni_text2general completed but returned no audio output."
+            )
+
+        artifacts_dir = out_dir / "artifacts"
+        items: list[dict[str, Any]] = []
+        multi = len(audio_results) > 1
+        for idx, entry in enumerate(audio_results):
+            rid = str(entry.get("request_id") or f"req_{idx + 1}")
+            audio_obj = entry.get("audio")
+            save_path = self.resolve_save_path(
+                cfg,
+                out_dir,
+                index=idx,
+                ext=output_format,
+                multi=multi,
+                default_prefix="narration",
+            )
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_audio(audio_obj, save_path, sample_rate=sample_rate)
+            item: dict[str, Any] = {
+                "index": idx,
+                "request_id": rid,
+                "prompt": texts[idx] if idx < len(texts) else None,
+                "audio": artifact_ref(self.relative_to(save_path, artifacts_dir)),
+            }
+            text_out = text_results.get(rid)
+            if text_out:
+                item["text"] = text_out
+            items.append(item)
+
+        first = items[0]["audio"] if items else {}
+        result: dict[str, Any] = {
+            "ok": True,
+            "executor": self.name,
+            "mode": "narration",
+            "model": self._model_name,
+            "audio": first,
+            "items": items,
+            "sample_rate": sample_rate,
+        }
+        storyboard = spec_dict.get("storyboard")
+        if isinstance(storyboard, dict):
+            result["storyboard"] = dict(storyboard)
+        maybe_upload_artifacts(task, out_dir, logger=logger)
+        return result
+
+    # ── model ────────────────────────────────────────────────────────────
+
+    def _ensure_omni(self, spec_dict: dict[str, Any]) -> None:
+        cfg = _narration_cfg(spec_dict)
+        model_name = self.resolve_model_identifier(
+            spec_dict,
+            cfg,
+            env_keys=("OMNI_NARRATION_MODEL",),
+            default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        )
+        new_spec = self._build_omni_spec(model_name, cfg)
+        if self._omni is not None:
+            if self._omni_spec == new_spec:
+                logger.info("Reusing existing Omni instance for model %s", model_name)
+                return
+            logger.info(
+                "Releasing previous Omni instance for model %s (spec changed)",
+                self._model_name,
+            )
+            self._close_omni()
+        self._omni = Omni(**self.build_omni_init_kwargs(model_name, cfg))
+        self._model_name = model_name
+        self._omni_spec = new_spec
+
+    # ── prompt ───────────────────────────────────────────────────────────
+
+    def _build_prompt(self, text: str, spec_dict: dict[str, Any]) -> str:
+        cfg = _narration_cfg(spec_dict)
+        if to_bool(cfg.get("raw_prompt"), default=False):
+            return text
+        system_prompt = str(cfg.get("system_prompt") or _DEFAULT_SYSTEM_PROMPT).strip()
+        return (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"{text}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+
+
+# ── narration-specific helpers ───────────────────────────────────────────────
+
+
+def _narration_cfg(spec_dict: dict[str, Any]) -> dict[str, Any]:
+    return OmniExecutorBase.omni_cfg(spec_dict, "omni:narration", "omni_text2general")
+
+
+def _parse_modalities(value: Any) -> list[str]:
+    if value is None:
+        return ["audio"]
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+        return parts or ["audio"]
+    if isinstance(value, list):
+        parts = [str(p).strip() for p in value if str(p).strip()]
+        return parts or ["audio"]
+    return ["audio"]
+
+
+def _build_sampling_params(cfg: dict[str, Any]) -> list[Any]:
+    seed = to_int(cfg.get("seed"), default=42)
+    talker_stop = to_int_list(cfg.get("talker_stop_token_ids"), default=[2150])
+    thinker = SamplingParams(
+        temperature=to_float(cfg.get("thinker_temperature"), default=0.9),
+        top_p=to_float(cfg.get("thinker_top_p"), default=0.9),
+        top_k=to_int(cfg.get("thinker_top_k"), default=-1),
+        max_tokens=to_int(cfg.get("thinker_max_tokens"), default=1200),
+        repetition_penalty=to_float(
+            cfg.get("thinker_repetition_penalty"), default=1.05
+        ),
+        logit_bias={},
+        seed=seed,
+    )
+    talker = SamplingParams(
+        temperature=to_float(cfg.get("talker_temperature"), default=0.9),
+        top_k=to_int(cfg.get("talker_top_k"), default=50),
+        max_tokens=to_int(cfg.get("talker_max_tokens"), default=4096),
+        seed=seed,
+        detokenize=False,
+        repetition_penalty=to_float(cfg.get("talker_repetition_penalty"), default=1.05),
+        stop_token_ids=talker_stop,
+    )
+    code2wav = SamplingParams(
+        temperature=to_float(cfg.get("code2wav_temperature"), default=0.0),
+        top_p=to_float(cfg.get("code2wav_top_p"), default=1.0),
+        top_k=to_int(cfg.get("code2wav_top_k"), default=-1),
+        max_tokens=to_int(cfg.get("code2wav_max_tokens"), default=4096 * 16),
+        seed=seed,
+        detokenize=True,
+        repetition_penalty=to_float(
+            cfg.get("code2wav_repetition_penalty"), default=1.1
+        ),
+    )
+    return [thinker, talker, code2wav]
+
+
+def _extract_request_audio(req: Any) -> Any:
+    outputs = getattr(req, "outputs", None)
+    if isinstance(outputs, list) and outputs:
+        mm = getattr(outputs[0], "multimodal_output", None)
+        if isinstance(mm, dict) and mm.get("audio") is not None:
+            return extract_audio_from_mm(mm)
+    if isinstance(req, dict):
+        mm = req.get("multimodal_output")
+        if isinstance(mm, dict) and mm.get("audio") is not None:
+            return extract_audio_from_mm(mm)
+    return None
+
+
+def _extract_text_output(req: Any) -> str | None:
+    outputs = getattr(req, "outputs", None)
+    if isinstance(outputs, list) and outputs:
+        text = getattr(outputs[0], "text", None)
+        if text is not None:
+            s = str(text).strip()
+            return s if s else None
+    if isinstance(req, dict):
+        outputs = req.get("outputs")
+        if isinstance(outputs, list) and outputs and isinstance(outputs[0], dict):
+            text = outputs[0].get("text")
+            if text is not None:
+                s = str(text).strip()
+                return s if s else None
+    return None
+
+
+def _request_id(req: Any, default_index: int) -> str:
+    value = getattr(req, "request_id", None)
+    if value in (None, "") and isinstance(req, dict):
+        value = req.get("request_id")
+    return str(value) if value not in (None, "") else f"req_{default_index}"

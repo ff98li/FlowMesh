@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowmesh-cli-stack"
+version = "0.1.0"
+description = "FlowMesh CLI stack commands"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flowmesh-cli>=0.1.0",
+    "flowmesh-sdk-stack>=0.1.0",
+    "docker>=7.1.0",
+    "pyyaml>=6.0.2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"flowmesh_cli_stack" = [
+    "assets/**",
+    "assets/.env.example",
+]

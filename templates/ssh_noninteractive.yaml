@@ -1,0 +1,25 @@
+apiVersion: flowmesh/v1
+kind: SSHTask
+metadata:
+  name: batch-job
+  annotations:
+    description: "Non-interactive SSH task: runs a command in a container and collects output"
+
+spec:
+  taskType: ssh
+  interactive: false
+  image: python:3.12-slim
+  command: ["python", "-c", "import json, pathlib; pathlib.Path('/mnt/flowmesh/output/result.json').write_text(json.dumps({'status': 'ok', 'answer': 42})); print('Done!')"]
+  ttlSeconds: 3600
+  sshOutput:
+    mountPath: /mnt/flowmesh/output
+    maxBytes: 1073741824
+  env:
+    MY_CUSTOM_VAR: "hello"
+  output:
+    destination:
+      type: http
+    artifacts:
+      - "results.json"
+      - "logs"
+      - "artifacts"

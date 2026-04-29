@@ -1,0 +1,100 @@
+apiVersion: flowmesh/v1
+kind: InferenceTask
+metadata:
+  name: inference-vllm-structured
+  owner: alice
+  annotations:
+    description: vLLM structured-output demo — raw JSON schema (nested objects and arrays).
+
+spec:
+  taskType: "inference"
+  resources:
+    replicas: 1
+    hardware:
+      cpu: "8"
+      memory: "16Gi"
+      gpu:
+        type: "any"         # or a specific model, e.g. "nvidia-a100-80gb"
+        count: 1
+        memory: "8Gi"
+  model:
+    source:
+      type: huggingface
+      identifier: Qwen/Qwen2.5-1.5B-Instruct
+      revision: main
+    vllm:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.9
+      trust_remote_code: true
+
+  data:
+    type: graph_template
+    template:
+      name: format
+      columns:
+      - label: stock_analysis_input
+        data:
+          type: list
+          items:
+          - ADI
+          - ADP
+          - CMCSA
+          - DASH
+          - CEG
+      options:
+        format:
+          steps:
+          - label: stock_analysis_format
+            template: Plan a SQL lookback window for symbol {ref0}. Return a
+              primary start_date (inclusive lower bound) plus a short rationale
+              and up to three fallback dates covering alternative regimes
+              (pre-earnings, post-earnings, rate-hike cycle, etc.). All dates
+              must be YYYY-MM-DD.
+            arguments:
+            - label: ref0
+              value: stock_analysis_input
+          messages:
+          - role: system
+            content: You are a SQL date planner. Emit ONE JSON object that
+              matches the response schema — no prose, no markdown fences.
+          - role: user
+            content: stock_analysis_format
+
+  inference:
+    max_tokens: 1024
+    temperature: 0.0
+    top_p: 1.0
+
+    # templates: dict → raw JSON schema; list → named fields
+    # (see inference_vllm_all_args.yaml).
+    templates:
+      type: object
+      properties:
+        start_date:
+          type: string
+          description: Primary inclusive lower-bound date (YYYY-MM-DD).
+        rationale:
+          type: string
+          description: Why this window, in one sentence.
+          maxLength: 200
+        alternative_dates:
+          type: array
+          maxItems: 3
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                description: Alternative start_date (YYYY-MM-DD).
+              regime:
+                type: string
+                description: Short label for the regime, e.g. "post-earnings".
+            required: [date, regime]
+      required: [start_date, rationale, alternative_dates]
+
+  output:
+    destination:
+      type: "http"
+    artifacts:
+      - "results.json"
+      - "logs"

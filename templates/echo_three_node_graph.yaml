@@ -1,0 +1,60 @@
+# echo_three_node_graph.yaml
+#
+# Three-node EchoExecutor workflow:
+# - echo-a and echo-b emit string literals
+# - echo-merge aggregates outputs from both upstream nodes
+
+apiVersion: flowmesh/v1
+kind: EchoTask
+metadata:
+  name: echo-three-node-graph
+  owner: smoke-test
+  annotations:
+    description: "Three-node graph demo for EchoExecutor aggregation"
+
+spec:
+  taskType: "echo"
+
+  resources:
+    replicas: 1
+    hardware:
+      cpu: "1"
+      memory: "1Gi"
+
+  graph:
+    nodes:
+      - name: echo-a
+        spec:
+          taskType: "echo"
+          data:
+            type: "list"
+            items:
+              - "literal_from_a"
+
+      - name: echo-b
+        spec:
+          taskType: "echo"
+          data:
+            type: "list"
+            items:
+              - "literal_from_b"
+
+      - name: echo-merge
+        dependsOn: ["echo-a", "echo-b"]
+        spec:
+          taskType: "echo"
+          data:
+            type: "list"
+            items:
+              - node: "echo-a"
+                path: "result.items[0].output"
+              - node: "echo-b"
+                path: "result.items[0].output"
+
+  output:
+    destination:
+      type: "http"
+    artifacts:
+      - "results.json"
+      - "logs"
+      - "artifacts"

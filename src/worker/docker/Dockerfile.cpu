@@ -1,0 +1,69 @@
+# CPU-only worker image (Debian bookworm), installs worker deps via uv
+FROM python:3.12-slim
+
+LABEL org.opencontainers.image.title="FlowMesh Worker (CPU)" \
+      org.opencontainers.image.description="CPU-only FlowMesh worker runtime" \
+      org.opencontainers.image.source="https://github.com/mlsys-io/FlowMesh" \
+      org.opencontainers.image.url="https://github.com/mlsys-io/FlowMesh"
+
+ARG TZ=Asia/Singapore
+ENV TZ=${TZ} \
+    DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    UV_TORCH_BACKEND=cpu
+
+# Install base OS packages and tini
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+ && echo $TZ > /etc/timezone \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl git tini tzdata \
+ && rm -rf /var/lib/apt/lists/*
+
+# Create isolated venv and install uv for dependency resolution
+RUN python -m venv /opt/py312 \
+ && /opt/py312/bin/pip install --upgrade pip uv
+ENV PATH=/opt/py312/bin:$PATH
+
+# Non-root user for runtime
+RUN useradd -m -u 10001 appuser
+
+WORKDIR /app
+
+# Install Python dependencies (CPU stack only)
+COPY src/worker/requirements/requirements.txt /tmp/requirements.txt
+RUN uv pip install --python /opt/py312/bin/python --system --requirement /tmp/requirements.txt \
+ && rm -f /tmp/requirements.txt
+
+# Application code
+COPY src/worker ./worker
+COPY src/shared ./shared
+
+# Default worker env knobs
+ENV SUPERVISOR_GRPC_TARGET=flowmesh_server:50051 \
+    RESULTS_DIR=/app/worker/results \
+    LOG_LEVEL=INFO \
+    HEARTBEAT_INTERVAL_SEC=30
+
+# Ensure scripts are executable and directories owned by appuser
+RUN chmod +x /app/worker/entrypoint.sh \
+ && mkdir -p /app/worker/results \
+ && chown -R appuser:appuser /app
+
+USER appuser
+
+ENV PYTHONPATH=/app
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["python", "-m", "worker.healthcheck"]
+
+ARG BUILD_VERSION=dev
+ARG BUILD_REF=local
+ARG BUILD_CREATED=unknown
+LABEL org.opencontainers.image.version="${BUILD_VERSION}" \
+      org.opencontainers.image.created="${BUILD_CREATED}" \
+      org.opencontainers.image.revision="${BUILD_REF}"
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/app/worker/entrypoint.sh"]

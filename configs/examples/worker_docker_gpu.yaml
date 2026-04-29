@@ -1,0 +1,5 @@
+provider: docker
+init_on_start: true
+worker_config:
+  worker_alias: gpu_worker
+  worker_type: gpu

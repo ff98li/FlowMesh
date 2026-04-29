@@ -1,0 +1,56 @@
+apiVersion: flowmesh/v1
+kind: SSHTask
+metadata:
+  name: noninteractive-with-inputs
+  annotations:
+    description: "Multi-stage workflow: upstream echo feeds into a non-interactive SSH task"
+
+spec:
+  stages:
+    - name: preprocess
+      spec:
+        taskType: echo
+        data:
+          type: list
+          items:
+            - "upstream data for non-interactive processing"
+            - "inspect /mnt/flowmesh/inputs/preprocess/results.json inside the container"
+        output:
+          destination:
+            type: http
+          artifacts:
+            - "results.json"
+            - "logs"
+            - "artifacts"
+
+    - name: process
+      dependsOn: [preprocess]
+      spec:
+        taskType: ssh
+        interactive: false
+        image: python:3.12-slim
+        command:
+          - python
+          - -c
+          - |
+            import json, pathlib
+            # Read upstream input
+            upstream = json.loads(pathlib.Path('/mnt/flowmesh/inputs/preprocess/results.json').read_text())
+            # Process and write output
+            result = {'processed': True, 'input_summary': str(upstream)[:200]}
+            pathlib.Path('/mnt/flowmesh/output/result.json').write_text(json.dumps(result, indent=2))
+            print('Processing complete!')
+        ttlSeconds: 3600
+        inputs:
+          - stage: preprocess
+            mountPath: /mnt/flowmesh/inputs/preprocess
+        sshOutput:
+          mountPath: /mnt/flowmesh/output
+          maxBytes: 1073741824
+        output:
+          destination:
+            type: http
+          artifacts:
+            - "results.json"
+            - "logs"
+            - "artifacts"

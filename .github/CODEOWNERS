@@ -1,0 +1,5 @@
+# Default owner for everything
+* @kaiitunnz
+
+# Worker and executors
+/src/worker/ @kaiitunnz @timzsu

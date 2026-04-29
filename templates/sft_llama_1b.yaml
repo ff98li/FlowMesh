@@ -1,0 +1,62 @@
+# sft_mistral_7b.yaml
+#
+# Example supervised fine-tuning task that uses the new TRL-based SFT executor.
+# Update the model identifier and dataset configuration to match your workload.
+
+apiVersion: flowmesh/v1
+kind: SFTTask
+metadata:
+  name: gpt2-sft-demo
+  owner: research
+  annotations:
+    description: "Supervised fine-tuning demo using TRL SFTExecutor"
+
+spec:
+  taskType: "sft"
+
+  resources:
+    replicas: 1
+    hardware:
+      cpu: "8"
+      memory: "32Gi"
+      gpu:
+        count: 1
+        type: "any"
+
+  model:
+    source:
+      type: "huggingface"
+      identifier: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+  data:
+    dataset_name: "openai/gsm8k"
+    config_name: "main"
+    split: "train[:5%]"
+    prompt_column: "question"
+    response_column: "answer"
+    separator: "\n\nAnswer: "
+    max_samples: 200
+
+  training:
+    allow_multi_gpu: false
+    num_train_epochs: 2
+    batch_size: 4
+    gradient_accumulation_steps: 4
+    learning_rate: 5.0e-5
+    max_seq_length: 512
+    logging_steps: 5
+    save_steps: 50
+    save_model: true
+    gradient_checkpointing: true
+    packing: false
+    fp16: false
+    bf16: true
+
+  output:
+    destination:
+      type: "local"
+      path: "./sft_llama_1b"
+    artifacts:
+      - "results.json"
+      - "logs"
+      - "artifacts/checkpoints"

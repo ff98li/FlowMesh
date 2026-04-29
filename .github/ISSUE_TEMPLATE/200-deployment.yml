@@ -1,0 +1,82 @@
+name: Deployment / Installation
+description: Report an issue with installing or deploying FlowMesh.
+title: "[Deploy]: "
+labels: ["deployment"]
+
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Before submitting, please search
+        [existing issues](https://github.com/mlsys-io/FlowMesh/issues?q=is%3Aissue+sort%3Acreated-desc+)
+        to avoid duplicates.
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment method
+      options:
+        - Local (uv / pip)
+        - Docker Compose (dev)
+        - Docker (cluster)
+        - Vast.ai
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Affected tier
+      options:
+        - Server
+        - Worker
+        - Redis
+        - Multiple / unclear
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Describe the issue
+      description: |
+        What went wrong during installation or deployment?
+        Include the commands you ran and the full error output.
+      placeholder: |
+        Steps to reproduce:
+        1. ...
+
+        ```
+        Error output
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Environment
+      description: >
+        FlowMesh version/commit, OS, Docker version, Python version,
+        GPU model (if relevant), cloud provider (if applicable).
+      value: |
+        - FlowMesh version:
+        - OS:
+        - Docker version:
+        - Python version:
+        - GPU:
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Relevant config / logs
+      description: >
+        Paste relevant .env settings (redact secrets), docker-compose overrides,
+        or container logs. Use triple-backtick blocks.
+
+  - type: checkboxes
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have searched existing issues and confirmed this is not a duplicate.
+          required: true

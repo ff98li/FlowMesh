@@ -1,0 +1,445 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "promptType": "define",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.8,
+      "position": [
+        -16,
+        -896
+      ],
+      "id": "c8d77577-bafc-486d-9705-7f7f01fa2691",
+      "name": "Inference A",
+      "notes": "{\"taskType\": \"inference\"}"
+    },
+    {
+      "parameters": {
+        "model": "meta-llama/Llama-3.2-1B-Instruct",
+        "options": {
+          "maxTokens": 128,
+          "temperature": 1,
+          "topK": 1,
+          "topP": 1
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmOpenHuggingFaceInference",
+      "typeVersion": 1,
+      "position": [
+        -16,
+        -736
+      ],
+      "id": "ddbfcacc-b5b5-4167-8373-31e7ae2bfbef",
+      "name": "Model Spec A",
+      "credentials": {
+        "huggingFaceApi": {
+          "id": "6sYYklxINZZKBkrv",
+          "name": "HuggingFaceApi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"type\": \"list\",\n  \"items\": [\n    \"List three long-term benefits of transitioning to renewable energy.\"\n  ]\n}",
+        "options": {
+          "dotNotation": false
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -176,
+        -896
+      ],
+      "id": "bd30c2d8-f512-4a95-9721-1de7c86daee3",
+      "name": "Input A"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"tensor_parallel_size\": 1,\n  \"gpu_memory_utilization\": 0.9,\n  \"trust_remote_code\": true\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -32,
+        -1040
+      ],
+      "id": "c2f905a0-84c7-4a4a-b35c-63dd3fd78c31",
+      "name": "Runtime Spec A"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"replicas\": 1,\n  \"hardware\": {\n    \"cpu\": \"8\",\n    \"memory\": \"32Gi\",\n    \"gpu\": {\n      \"type\": \"any\",\n      \"count\": 1\n    }\n  }\n}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        128,
+        -1040
+      ],
+      "id": "25bb0591-af79-4c90-827e-661554cc3649",
+      "name": "Resource Spec A"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"type\": \"list\",\n  \"items\": [\n    \"Identify two major challenges organizations face when adopting renewable energy.\"\n  ]\n}",
+        "options": {
+          "dotNotation": false
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -176,
+        -464
+      ],
+      "id": "afe6841b-eba0-47e2-921e-b7a520172800",
+      "name": "Input B"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"tensor_parallel_size\": 1,\n  \"gpu_memory_utilization\": 0.9,\n  \"trust_remote_code\": true\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -16,
+        -608
+      ],
+      "id": "4dacdaec-6b5f-4b62-8930-becd684dbf70",
+      "name": "Runtime Spec B"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"replicas\": 1,\n  \"hardware\": {\n    \"cpu\": \"8\",\n    \"memory\": \"32Gi\",\n    \"gpu\": {\n      \"type\": \"any\",\n      \"count\": 1\n    }\n  }\n}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        144,
+        -608
+      ],
+      "id": "e6f83719-9e22-4d7a-a298-e6e5253fbf49",
+      "name": "Resource Spec B"
+    },
+    {
+      "parameters": {
+        "model": "meta-llama/Llama-3.2-1B-Instruct",
+        "options": {
+          "maxTokens": 128,
+          "temperature": 1,
+          "topK": 1,
+          "topP": 1
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmOpenHuggingFaceInference",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -304
+      ],
+      "id": "6ae94922-1702-4c77-9228-99f5b7de4121",
+      "name": "Model Spec B",
+      "credentials": {
+        "huggingFaceApi": {
+          "id": "6sYYklxINZZKBkrv",
+          "name": "HuggingFaceApi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n    \"type\": \"graph_template\",\n    \"template\": {\n      \"name\": \"two_column_briefing\",\n      \"columns\": [\n        {\n          \"label\": \"Benefits insight\",\n          \"node\": \"Inference A\",\n          \"path\": \"result.items[0].output\"\n        },\n        {\n          \"label\": \"Challenges insight\",\n          \"node\": \"Inference B\",\n          \"path\": \"result.items[0].output\"\n        }\n      ]\n    }\n  }",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        352,
+        -720
+      ],
+      "id": "39bf2958-fd88-48e3-b31b-5f66fcfda5f9",
+      "name": "Format"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.8,
+      "position": [
+        0,
+        -464
+      ],
+      "id": "c8cf547c-38e1-4d7c-9c12-6bd4e62dc0d6",
+      "name": "Inference B",
+      "notes": "{\"taskType\": \"inference\"}"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.8,
+      "position": [
+        528,
+        -720
+      ],
+      "id": "b72d5b93-d9fd-4e66-868e-1a5ecf16e6b4",
+      "name": "Synthesis",
+      "notes": "{\"taskType\": \"inference\"}"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"tensor_parallel_size\": 1,\n  \"gpu_memory_utilization\": 0.9,\n  \"trust_remote_code\": true\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        496,
+        -896
+      ],
+      "id": "26953702-1736-4d9a-8c17-ba6523ded5db",
+      "name": "Runtime Spec S"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"replicas\": 1,\n  \"hardware\": {\n    \"cpu\": \"8\",\n    \"memory\": \"32Gi\",\n    \"gpu\": {\n      \"type\": \"any\",\n      \"count\": 1\n    }\n  }\n}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        656,
+        -896
+      ],
+      "id": "ac3519b9-0f58-40ef-9edd-9712792577d8",
+      "name": "Resource Spec S"
+    },
+    {
+      "parameters": {
+        "model": "meta-llama/Llama-3.2-1B-Instruct",
+        "options": {
+          "maxTokens": 128,
+          "temperature": 1,
+          "topK": 1,
+          "topP": 1
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmOpenHuggingFaceInference",
+      "typeVersion": 1,
+      "position": [
+        528,
+        -544
+      ],
+      "id": "477f4948-b75a-44e3-9ed0-2f183bfa0a8e",
+      "name": "Model Spec S1",
+      "credentials": {
+        "huggingFaceApi": {
+          "id": "6sYYklxINZZKBkrv",
+          "name": "HuggingFaceApi account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -350,
+        -896
+      ],
+      "id": "9d4aeb2d-0407-479c-a94b-067197a44839",
+      "name": "When clicking ‘Execute workflow’"
+    }
+  ],
+  "connections": {
+    "Inference A": {
+      "main": [
+        [
+          {
+            "node": "Format",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Model Spec A": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Inference A",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input A": {
+      "main": [
+        [
+          {
+            "node": "Inference A",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Runtime Spec A": {
+      "main": [
+        [
+          {
+            "node": "Inference A",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resource Spec A": {
+      "main": [
+        [
+          {
+            "node": "Inference A",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input B": {
+      "main": [
+        [
+          {
+            "node": "Inference B",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Runtime Spec B": {
+      "main": [
+        [
+          {
+            "node": "Inference B",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resource Spec B": {
+      "main": [
+        [
+          {
+            "node": "Inference B",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Model Spec B": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Inference B",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format": {
+      "main": [
+        [
+          {
+            "node": "Synthesis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inference B": {
+      "main": [
+        [
+          {
+            "node": "Format",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Runtime Spec S": {
+      "main": [
+        [
+          {
+            "node": "Synthesis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resource Spec S": {
+      "main": [
+        [
+          {
+            "node": "Synthesis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Model Spec S1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Synthesis",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Input A",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "45ca4c6175abf8c77a853b8cc598f4fd94a62d85f750a16a9d4bc2a929fa004b"
+  }
+}

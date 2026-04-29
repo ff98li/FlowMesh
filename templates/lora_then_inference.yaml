@@ -1,0 +1,104 @@
+# Adapt Llama-1B on GSM8K with LoRA, then load the merged weights and run inference
+# evaluation on GSM8K.
+apiVersion: flowmesh/v1
+kind: LoRASFTTask
+metadata:
+  name: llama1b-lora-transfer-eval
+  owner: demo
+  annotations:
+    description: "LoRA adaptation on GSM8K followed by merged-weight inference on GSM8K"
+
+spec:
+  taskType: "lora_sft"
+
+  resources:
+    replicas: 1
+    hardware:
+      cpu: "12"
+      memory: "46Gi"
+      gpu:
+        type: "any"
+        count: 1
+        memory: "46Gi"
+
+  model:
+    source:
+      type: "huggingface"
+      identifier: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+      revision: "main"
+
+  stages:
+    - name: lora-train
+      spec:
+        taskType: "lora_sft"
+        lora:
+          r: 16
+          alpha: 32
+          dropout: 0.05
+          bias: "none"
+          target_modules:
+            - "q_proj"
+            - "k_proj"
+            - "v_proj"
+            - "o_proj"
+          task_type: "CAUSAL_LM"
+        data:
+          dataset_name: "openai/gsm8k"
+          config_name: "main"
+          split: "train[:1%]"
+          prompt_column: "question"
+          response_column: "answer"
+          separator: "\n\nReference answer: "
+          max_samples: 200
+        training:
+          num_train_epochs: 1
+          batch_size: 2
+          gradient_accumulation_steps: 4
+          learning_rate: 2.0e-4
+          max_seq_length: 512
+          logging_steps: 20
+          save_steps: 80
+          save_model: true
+          gradient_checkpointing: false
+          packing: false
+          fp16: false
+          bf16: true
+        output:
+          destination:
+            type: "http"
+            url: "http://127.0.0.1:8000/api/v1/results"
+            timeoutSec: 1800
+          artifacts:
+            - "results.json"
+            - "final_lora"
+            - "logs"
+
+    - name: gsm8k-inference
+      spec:
+        taskType: "inference"
+        model:
+          adapters:
+            - type: "lora"
+              url: "${lora-train.result.final_lora_archive}"
+        data:
+          type: "dataset"
+          url: "openai/gsm8k"
+          name: "main"
+          split: "train[:200]"
+          column: "question"
+          shuffle: true
+          seed: 11
+        inference:
+          system_prompt: |
+            Apply the math-specialist LoRA adapter to solve the word problem step by step and end with "Answer: <value>".
+          max_tokens: 256
+          temperature: 0.2
+          top_p: 0.9
+        output:
+          destination:
+            type: "http"
+            url: "http://127.0.0.1:8000/api/v1/results"
+            timeoutSec: 30
+          artifacts:
+            - "results.json"
+            - "logs"

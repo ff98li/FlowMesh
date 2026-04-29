@@ -1,0 +1,190 @@
+name: flowmesh-node
+
+services:
+  redis_control:
+    image: redis:7-alpine
+    container_name: flowmesh_node_redis_control
+    environment:
+      REDIS_ACL_ENABLED: ${REDIS_ACL_ENABLED:-0}
+      REDIS_USERNAME: ${REDIS_USERNAME:-admin}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_TLS_CA_FILE: ${REDIS_TLS_CA_FILE:-}
+      REDIS_TLS_CERT_FILE: ${REDIS_TLS_CERT_FILE:-}
+      REDIS_TLS_KEY_FILE: ${REDIS_TLS_KEY_FILE:-}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        if [ "${REDIS_ACL_ENABLED:-0}" = "1" ]; then
+          if [ -z "${REDIS_PASSWORD:-}" ]; then
+            echo "REDIS_PASSWORD required when REDIS_ACL_ENABLED=1" >&2
+            exit 1
+          fi
+          mkdir -p /etc/redis
+          printf "user default off\nuser %s on >%s ~* &* +@all\n" "$${REDIS_USERNAME:-admin}" "$${REDIS_PASSWORD}" > /etc/redis/users.acl
+        fi
+        if [ -n "${REDIS_TLS_CA_FILE:-}" ] || [ -n "${REDIS_TLS_CERT_FILE:-}" ] || [ -n "${REDIS_TLS_KEY_FILE:-}" ]; then
+          if [ -z "${REDIS_TLS_CA_FILE:-}" ] || [ -z "${REDIS_TLS_CERT_FILE:-}" ] || [ -z "${REDIS_TLS_KEY_FILE:-}" ]; then
+            echo "REDIS_TLS_CA_FILE, REDIS_TLS_CERT_FILE, REDIS_TLS_KEY_FILE are required to enable Redis TLS" >&2
+            exit 1
+          fi
+          TLS_ARGS="--tls-port 6379 --port 0 --tls-ca-cert-file ${REDIS_TLS_CA_FILE} --tls-cert-file ${REDIS_TLS_CERT_FILE} --tls-key-file ${REDIS_TLS_KEY_FILE} --tls-auth-clients no"
+        fi
+        if [ "${REDIS_ACL_ENABLED:-0}" = "1" ]; then
+          exec redis-server $${TLS_ARGS:-} --aclfile /etc/redis/users.acl --save 60 1 --loglevel warning --client-output-buffer-limit pubsub 1gb 512mb 60
+        else
+          exec redis-server $${TLS_ARGS:-} --save 60 1 --loglevel warning --client-output-buffer-limit pubsub 1gb 512mb 60
+        fi
+    ports:
+      - "${REDIS_CONTROL_PORT:-6379}:6379"
+    volumes:
+      - redis_control_data:/data
+      - ${REDIS_TLS_DIR:-./secrets/tls/redis}:/etc/ssl/redis:ro
+    restart: unless-stopped
+    networks:
+      - flowmesh_node_network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          TLS_ENABLED=0
+          if [ -n "${REDIS_TLS_CA_FILE:-}" ] && [ -n "${REDIS_TLS_CERT_FILE:-}" ] && [ -n "${REDIS_TLS_KEY_FILE:-}" ]; then
+            TLS_ENABLED=1
+          fi
+          if [ "${REDIS_ACL_ENABLED:-0}" = "1" ]; then
+            if [ "$${TLS_ENABLED}" = "1" ]; then
+              redis-cli --tls --cacert "${REDIS_TLS_CA_FILE:-}" -u "rediss://${REDIS_USERNAME:-admin}:${REDIS_PASSWORD}@localhost:6379/0" ping
+            else
+              redis-cli -u "redis://${REDIS_USERNAME:-admin}:${REDIS_PASSWORD}@localhost:6379/0" ping
+            fi
+          else
+            if [ "$${TLS_ENABLED}" = "1" ]; then
+              redis-cli --tls --cacert "${REDIS_TLS_CA_FILE:-}" -p 6379 ping
+            else
+              redis-cli -p 6379 ping
+            fi
+          fi
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis_telemetry:
+    image: redis:7-alpine
+    container_name: flowmesh_node_redis_telemetry
+    environment:
+      REDIS_ACL_ENABLED: ${REDIS_ACL_ENABLED:-0}
+      REDIS_USERNAME: ${REDIS_USERNAME:-admin}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_TLS_CA_FILE: ${REDIS_TLS_CA_FILE:-}
+      REDIS_TLS_CERT_FILE: ${REDIS_TLS_CERT_FILE:-}
+      REDIS_TLS_KEY_FILE: ${REDIS_TLS_KEY_FILE:-}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        if [ "${REDIS_ACL_ENABLED:-0}" = "1" ]; then
+          if [ -z "${REDIS_PASSWORD:-}" ]; then
+            echo "REDIS_PASSWORD required when REDIS_ACL_ENABLED=1" >&2
+            exit 1
+          fi
+          mkdir -p /etc/redis
+          printf "user default off\nuser %s on >%s ~* &* +@all\n" "$${REDIS_USERNAME:-admin}" "$${REDIS_PASSWORD}" > /etc/redis/users.acl
+        fi
+        if [ -n "${REDIS_TLS_CA_FILE:-}" ] || [ -n "${REDIS_TLS_CERT_FILE:-}" ] || [ -n "${REDIS_TLS_KEY_FILE:-}" ]; then
+          if [ -z "${REDIS_TLS_CA_FILE:-}" ] || [ -z "${REDIS_TLS_CERT_FILE:-}" ] || [ -z "${REDIS_TLS_KEY_FILE:-}" ]; then
+            echo "REDIS_TLS_CA_FILE, REDIS_TLS_CERT_FILE, REDIS_TLS_KEY_FILE are required to enable Redis TLS" >&2
+            exit 1
+          fi
+          TLS_ARGS="--tls-port 6379 --port 0 --tls-ca-cert-file ${REDIS_TLS_CA_FILE} --tls-cert-file ${REDIS_TLS_CERT_FILE} --tls-key-file ${REDIS_TLS_KEY_FILE} --tls-auth-clients no"
+        fi
+        if [ "${REDIS_ACL_ENABLED:-0}" = "1" ]; then
+          exec redis-server $${TLS_ARGS:-} --aclfile /etc/redis/users.acl --save 300 1 --loglevel warning
+        else
+          exec redis-server $${TLS_ARGS:-} --save 300 1 --loglevel warning
+        fi
+    ports:
+      - "${REDIS_TELEMETRY_PORT:-6380}:6379"
+    volumes:
+      - redis_telemetry_data:/data
+      - ${REDIS_TLS_DIR:-./secrets/tls/redis}:/etc/ssl/redis:ro
+    restart: unless-stopped
+    networks:
+      - flowmesh_node_network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          TLS_ENABLED=0
+          if [ -n "${REDIS_TLS_CA_FILE:-}" ] && [ -n "${REDIS_TLS_CERT_FILE:-}" ] && [ -n "${REDIS_TLS_KEY_FILE:-}" ]; then
+            TLS_ENABLED=1
+          fi
+          if [ "${REDIS_ACL_ENABLED:-0}" = "1" ]; then
+            if [ "$${TLS_ENABLED}" = "1" ]; then
+              redis-cli --tls --cacert "${REDIS_TLS_CA_FILE:-}" -u "rediss://${REDIS_USERNAME:-admin}:${REDIS_PASSWORD}@localhost:6379/0" ping
+            else
+              redis-cli -u "redis://${REDIS_USERNAME:-admin}:${REDIS_PASSWORD}@localhost:6379/0" ping
+            fi
+          else
+            if [ "$${TLS_ENABLED}" = "1" ]; then
+              redis-cli --tls --cacert "${REDIS_TLS_CA_FILE:-}" -p 6379 ping
+            else
+              redis-cli -p 6379 ping
+            fi
+          fi
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  server:
+    image: ${FLOWMESH_REGISTRY:-ghcr.io/mlsys-io}/flowmesh_server:${FLOWMESH_VERSION:-dev}
+    container_name: flowmesh_node_server
+    depends_on:
+      redis_control:
+        condition: service_healthy
+      redis_telemetry:
+        condition: service_healthy
+    env_file:
+      - ${STACK_ENV_FILE:-./.env}
+    environment:
+      REDIS_CONTROL_URL: ${REDIS_CONTROL_URL:-redis://localhost:${REDIS_CONTROL_PORT:-6379}/0}
+      REDIS_TELEMETRY_URL: ${REDIS_TELEMETRY_URL:-redis://localhost:${REDIS_TELEMETRY_PORT:-6380}/0}
+      SERVER_METRICS_DIR: "/mnt/flowmesh-metrics"
+      LOG_FILE: "/var/log/flowmesh-server/server.log"
+      WORKER_CONFIG_PATH: /etc/flowmesh/worker_config.yaml
+      RESULTS_DIR: ${RESULTS_DIR:-flowmesh_results}
+      SERVER_APP_PORT: ${SERVER_HTTP_PORT:-8000}
+      FLOWMESH_BASE_URL: ${FLOWMESH_BASE_URL:-http://localhost:${SERVER_HTTP_PORT:-8000}}
+    volumes:
+      - flowmesh_results:/mnt/flowmesh-results
+      - flowmesh_metrics:/mnt/flowmesh-metrics
+      - flowmesh_server_logs:/var/log/flowmesh-server
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${SERVER_WORKER_CONFIG:-./configs/worker_config.yaml}:/etc/flowmesh/worker_config.yaml:ro
+      - ${REDIS_TLS_DIR:-./secrets/tls/redis}:/etc/ssl/redis:ro
+      - ${SERVER_TLS_DIR:-./secrets/tls/server}:/etc/ssl/server:ro
+    restart: unless-stopped
+    network_mode: host
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-sf",
+          "http://localhost:${SERVER_HTTP_PORT:-8000}/healthz",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  flowmesh_node_network:
+    name: flowmesh_node_network
+    driver: bridge
+
+volumes:
+  redis_control_data:
+  redis_telemetry_data:
+  flowmesh_results:
+  flowmesh_metrics:
+  flowmesh_server_logs:
