@@ -28,7 +28,6 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-.python-version
 
 # IDE
 .vscode/
@@ -70,3 +69,4 @@ exp/
 templates/
 scripts/
 README.md
+.claude/
