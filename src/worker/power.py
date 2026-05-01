@@ -1,12 +1,15 @@
 """Lightweight power sampling utilities for worker heartbeats."""
 
+import logging
 import os
-import shutil
-import subprocess
 import time
 from typing import Any
 
+import pynvml
+
 from shared.utils.time import now_iso
+
+logger = logging.getLogger(__name__)
 
 
 def _detect_cpu_energy_file() -> str | None:
@@ -72,6 +75,8 @@ class PowerMonitor:
         self._visible_gpu_indices = _parse_cuda_visible_devices(
             os.environ.get("CUDA_VISIBLE_DEVICES")
         )
+        self._nvml_initialized: bool | None = None
+        self._nvml_handles: dict[int, Any] = {}
 
     def sample(self) -> dict[str, Any]:
         """Collect a single power sample."""
@@ -188,44 +193,37 @@ class PowerMonitor:
         ) / dt  # convert microjoules to joules, then divide by seconds
         return watts
 
-    def _read_gpu_power(self) -> list[dict[str, Any]]:
-        if not shutil.which("nvidia-smi"):
-            return []
+    def _ensure_nvml(self) -> bool:
+        if self._nvml_initialized is not None:
+            return self._nvml_initialized
+        try:
+            pynvml.nvmlInit()
+        except pynvml.NVMLError as exc:
+            logger.debug("NVML init failed; skipping GPU power sampling: %s", exc)
+            self._nvml_initialized = False
+            return False
+        self._nvml_initialized = True
+        return True
 
+    def _read_gpu_power(self) -> list[dict[str, Any]]:
         visible = self._visible_gpu_indices
         if visible is not None and not visible:
             return []
-        try:
-            proc = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=index,power.draw",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except Exception:
-            return []
 
-        if proc.returncode != 0:
+        if not self._ensure_nvml():
             return []
 
         entries: list[dict[str, Any]] = []
-        for line in proc.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 2:
-                continue
-            try:
-                idx = int(parts[0])
-            except ValueError:
-                continue
-            try:
-                power = float(parts[1])
-            except ValueError:
-                power = None
-            if visible is not None and idx not in visible:
-                continue
-            entries.append({"index": idx, "power_w": power})
+        try:
+            for idx in range(pynvml.nvmlDeviceGetCount()):
+                if visible is not None and idx not in visible:
+                    continue
+                handle = self._nvml_handles.get(idx)
+                if handle is None:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                    self._nvml_handles[idx] = handle
+                power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
+                entries.append({"index": idx, "power_w": power})
+        except pynvml.NVMLError:
+            pass
         return entries
