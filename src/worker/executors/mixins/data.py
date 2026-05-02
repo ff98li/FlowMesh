@@ -1,19 +1,10 @@
-"""Data mixin helpers used by executors.
-
-This module contains small utilities encapsulated in the ``DataMixin``
-class that help executors interact with data sources (via connectors),
-normalize results into Pandas DataFrames. Only docstrings and explanatory comments
-live here — the implementation delegates actual I/O to connector objects obtained via
-``get_connector_from_spec`` which provide the runtime behavior (``execute``,
-``get_schema``, etc.).
-"""
+"""Worker mixin: data prep helpers (prompts, images, params, dataset shards)."""
 
 import copy
 import datetime
 import io
 import logging
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -59,6 +50,12 @@ class InferenceEntry:
 
 
 class DataMixin(GovernanceMixin):
+    """Data prep helpers (prompts, images, params, dataset shards).
+
+    Inherits :class:`GovernanceMixin` so every data-prep executor also gets
+    the trace + lineage emission surface (``_task_span`` / ``_span`` /
+    ``_log_event`` / ``_record_output`` / ``_dump_to_governance``).
+    """
 
     _TEMPLATE_TYPE_MAP: dict[str, type] = {
         "str": str,
@@ -76,11 +73,6 @@ class DataMixin(GovernanceMixin):
         "datetime": datetime.datetime,
         "timestamp": datetime.datetime,
     }
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._upstream_deps_cache: dict[str, dict[str, Any]] = {}
-        self.io_executor = ThreadPoolExecutor(max_workers=32)
 
     @classmethod
     def _resolve_param_type(cls, type_spec: str) -> type | None:
@@ -314,20 +306,6 @@ class DataMixin(GovernanceMixin):
             raise ExecutionError("spec.inference must be a mapping.")
         return inference
 
-    @staticmethod
-    def _spec_upstream_results(spec: TaskSpecStrictBase) -> dict[str, Any]:
-        context = spec.upstreamResults or {}
-        if not isinstance(context, dict):
-            raise ExecutionError("spec._upstreamResults must be a mapping.")
-        return context
-
-    @staticmethod
-    def _spec_governance_cfg(spec: TaskSpecStrictBase) -> dict[str, Any]:
-        governance = spec.governance or {}
-        if not isinstance(governance, dict):
-            raise ExecutionError("spec.governance must be a mapping.")
-        return governance
-
     def _collect_prompts_for_spec(
         self, spec: TaskSpecStrictBase, task_id: str, fetch_images: bool = False
     ) -> InferenceEntry:
@@ -540,29 +518,23 @@ class DataMixin(GovernanceMixin):
                     )
                 metadata_raw = list(raw_meta)
         elif dtype == "graph_template":
-            upstream_results = self._fetch_upstream_results_from_storage(spec)
+            upstream_results = self._spec_upstream_results(spec)
             logger.debug(
                 "Task %s graph_template upstream keys: %s",
                 task_id,
                 list(upstream_results.keys()),
             )
-            self._log_event(data_id=task_id, event_type="upstream fetch")
-            prompts = build_prompts_from_graph_template(data, spec)
-            self._log_event(
-                data_id=task_id,
-                event_type="build prompt from graph template",
-                event_data=f"Building prompts from graph_template for task {task_id}",
-            )
+            with self._span("build prompt from graph template", data_id=task_id):
+                prompts = build_prompts_from_graph_template(data, spec)
             template_cfg = data.get("template") or {}
             append_system_prompt = bool(template_cfg.get("append_system_prompt", False))
         elif dtype == "dataframe":
-            upstream_results = self._fetch_upstream_results_from_storage(spec)
+            upstream_results = self._spec_upstream_results(spec)
             logger.debug(
                 "Task %s dataframe upstream keys: %s",
                 task_id,
                 list(upstream_results.keys()),
             )
-            self._log_event(data_id=task_id, event_type="upstream fetch")
             df_columns_cfg = data.get("columns")
             if df_columns_cfg is None:
                 raise ExecutionError(
@@ -750,67 +722,6 @@ class DataMixin(GovernanceMixin):
         payload["items"] = grouped_items
         return payload
 
-    def _fetch_upstream_results_from_storage(
-        self, spec: TaskSpecStrictBase
-    ) -> dict[str, Any]:
-        """
-        Fetch upstream results from GovernanceRelay.
-
-        For each upstream result reference, fetches from GovernanceRelay,
-        verifies integrity against the server copy. Appends retrieval timestamp
-        to the event list as metadata.
-
-        Args:
-            spec: The task specification that may contain upstream results
-
-        Returns:
-            Dict of upstream results (empty if none found)
-        """
-        upstream_refs = self._spec_upstream_results(spec)
-        if not upstream_refs:
-            return {}
-
-        governance_spec = self._spec_governance_cfg(spec)
-        if not governance_spec:
-            logger.info("Governance not configured; returning upstream results as-is")
-            return upstream_refs
-
-        task_ids_to_fetch: set[str] = set(
-            upstream_spec["task_id"] for upstream_spec in upstream_refs.values()
-        )
-        if len(task_ids_to_fetch) == 1:
-            task_id = task_ids_to_fetch.pop()
-            self._upstream_deps_cache[task_id] = self._fetch_data(
-                task_id, governance_spec
-            )
-        else:
-            logger.info(
-                "Fetching %d upstream results in parallel",
-                len(task_ids_to_fetch),
-            )
-            future_map = {
-                self.io_executor.submit(
-                    self._fetch_data, task_id, governance_spec
-                ): task_id
-                for task_id in task_ids_to_fetch
-            }
-            for future in as_completed(future_map):
-                task_id = future_map[future]
-                try:
-                    self._upstream_deps_cache[task_id] = future.result()
-                except Exception as exc:
-                    raise ExecutionError(
-                        f"Failed to fetch upstream result for task {task_id}: {exc}"
-                    ) from exc
-
-        fetched_results = {
-            graph_node_name: upstream_spec
-            | {"result": self._upstream_deps_cache[upstream_spec["task_id"]]}
-            for graph_node_name, upstream_spec in upstream_refs.items()
-        }
-
-        return fetched_results
-
     def _maybe_apply_dataset_shard(self, dataset, spec: TaskSpecStrictBase):
         shard_cfg = spec.shard
         if shard_cfg is None:
@@ -824,105 +735,3 @@ class DataMixin(GovernanceMixin):
             return dataset.shard(num_shards=total, index=index, contiguous=contiguous)
         except Exception as exc:
             raise ExecutionError(f"Failed to shard dataset ({index}/{total}): {exc}")
-
-    def _extract_source_data_ids(self, spec: TaskSpecStrictBase) -> list[str]:
-        """Extract upstream task/data IDs from _upstreamResults for governance."""
-        upstream_refs = self._spec_upstream_results(spec)
-        ids: list[str] = []
-        for upstream in upstream_refs.values():
-            if not isinstance(upstream, dict):
-                continue
-            candidate = upstream.get("task_id") or upstream.get("data_id")
-            if candidate:
-                ids.append(str(candidate))
-        # Keep order but drop duplicates
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for ident in ids:
-            if ident in seen:
-                continue
-            seen.add(ident)
-            deduped.append(ident)
-        return deduped
-
-    def _dump_to_governance(
-        self,
-        governance_spec: dict[str, Any],
-        task_id: str,
-        result: dict[str, Any],
-        dependencies_by_task: dict[str, list[str]],
-    ) -> None:
-        """
-        Dump execution result and metadata to GovernanceRelay.
-
-        Keeps the object slim by excluding full nested structures where possible.
-        Logs the size of the dumped object.
-
-        Args:
-            governance_spec: GovernanceRelay specification dictionary
-            task_id: Task identifier
-            result: Execution result to dump
-            dependencies_by_task: Mapping of task_id -> list of source data dependencies
-        """
-
-        parent_deps = dependencies_by_task.get(task_id, [])
-        parent_events = self._events_for([task_id, *parent_deps])
-        children_payload = result.get("children", {})
-
-        collection_jobs: list[dict[str, Any]] = [
-            {
-                "task_id": task_id,
-                "result": result,
-                "deps": parent_deps,
-                "events": parent_events,
-                "is_parent": True,
-            }
-        ]
-        for child_id, child_result in children_payload.items():
-            child_deps = dependencies_by_task.get(child_id, [])
-            child_events = self._events_for([child_id, *child_deps])
-            collection_jobs.append(
-                {
-                    "task_id": child_id,
-                    "result": child_result,
-                    "deps": child_deps,
-                    "events": child_events,
-                    "is_parent": False,
-                }
-            )
-
-        if len(collection_jobs) == 1:
-            job = collection_jobs[0]
-            self._write_data(
-                data_id=job["task_id"],
-                data=job["result"],
-                source_data_ids=job["deps"],
-                governance_spec=governance_spec,
-                events=job["events"],
-            )
-        else:
-            logger.info(
-                "Writing data for %d merged tasks in parallel",
-                len(collection_jobs),
-            )
-            future_map = {
-                self.io_executor.submit(
-                    self._write_data,
-                    data_id=job["task_id"],
-                    data=job["result"],
-                    source_data_ids=job["deps"],
-                    governance_spec=governance_spec,
-                    events=job["events"],
-                ): job
-                for job in collection_jobs
-            }
-            for future in as_completed(future_map):
-                job = future_map[future]
-                try:
-                    future.result()
-                except Exception as exc:
-                    if job["is_parent"]:
-                        raise
-                    raise ExecutionError(
-                        f"Failed to write merged child task {job['task_id']}: {exc}"
-                    ) from exc

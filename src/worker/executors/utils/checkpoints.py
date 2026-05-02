@@ -457,3 +457,56 @@ def maybe_upload_artifacts(
         uploaded.append(rel_name)
 
     return uploaded
+
+
+def maybe_upload_traces(
+    task: TaskReference,
+    out_dir: Path,
+    logger: logging.Logger | None = None,
+    skip_errors: bool = False,
+) -> list[str]:
+    """Upload trace JSONL files under `out_dir/logs/` to
+    `<api-base>/traces/tasks/{task_id}/{trace_type}` when the task has an HTTP
+    destination; no-op otherwise. The destination's `/results` artifact base
+    is swapped for `/traces`. Returns uploaded trace types."""
+    if not task.task_id:
+        raise ExecutionError("Task id missing; cannot upload traces")
+    out_dir = Path(out_dir).resolve()
+    logs_dir = out_dir / "logs"
+    destination = get_http_destination(task.spec)
+    if destination is None or not logs_dir.is_dir():
+        return []
+
+    upload_base = destination.url.rstrip("/").removesuffix("/results") + "/traces"
+    uploaded: list[str] = []
+
+    for trace_type in ("spans", "assets", "lineage"):
+        file_path = logs_dir / f"{trace_type}.jsonl"
+        if not file_path.is_file():
+            continue
+        upload_url = f"{upload_base}/tasks/{task.task_id}/{trace_type}"
+        try:
+            with file_path.open("rb") as fh:
+                response = requests.request(
+                    destination.method,
+                    upload_url,
+                    files={"file": (file_path.name, fh, "application/octet-stream")},
+                    headers=destination.headers,
+                    timeout=destination.timeout,
+                )
+                response.raise_for_status()
+        except Exception as exc:
+            if not skip_errors:
+                raise ExecutionError(
+                    f"Trace upload failed for {file_path}: {exc}"
+                ) from exc
+            if logger:
+                logger.warning("Failed to upload trace %s: %s", trace_type, exc)
+            continue
+        if logger:
+            logger.info(
+                "Uploaded trace %s (%d bytes)", trace_type, file_path.stat().st_size
+            )
+        uploaded.append(trace_type)
+
+    return uploaded

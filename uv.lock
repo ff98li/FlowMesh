@@ -1910,6 +1910,7 @@ source = { editable = "cli" }
 dependencies = [
     { name = "flowmesh-sdk" },
     { name = "pyyaml" },
+    { name = "rich" },
     { name = "typer" },
     { name = "websockets" },
 ]
@@ -1924,6 +1925,7 @@ requires-dist = [
     { name = "flowmesh-cli-stack", marker = "extra == 'stack'", editable = "cli/stack" },
     { name = "flowmesh-sdk", editable = "sdk" },
     { name = "pyyaml", specifier = ">=6.0.2" },
+    { name = "rich", specifier = ">=14.2.0" },
     { name = "typer", specifier = ">=0.12.5" },
     { name = "websockets", specifier = ">=15.0" },
 ]
@@ -1954,6 +1956,7 @@ version = "0.1.0"
 source = { editable = "sdk" }
 dependencies = [
     { name = "httpx" },
+    { name = "pandas" },
     { name = "pydantic" },
     { name = "pyyaml" },
 ]
@@ -1961,6 +1964,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.27.0" },
+    { name = "pandas", specifier = ">=2.3.3" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
 ]

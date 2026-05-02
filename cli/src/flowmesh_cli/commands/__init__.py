@@ -8,6 +8,7 @@ from .result import app as results_app
 from .ssh import app as ssh_app
 from .system import app as system_app
 from .task import app as task_app
+from .trace import app as trace_app
 from .worker import app as worker_app
 from .workflow import app as workflow_app
 
@@ -22,3 +23,4 @@ def register(app: typer.Typer) -> None:
     app.add_typer(node_app, name="node")
     app.add_typer(worker_app, name="worker")
     app.add_typer(ssh_app, name="ssh")
+    app.add_typer(trace_app, name="trace")

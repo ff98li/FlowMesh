@@ -5,6 +5,7 @@ from . import (
     stack,
     system,
     tasks,
+    traces,
     workers,
     workflows,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "stack",
     "system",
     "tasks",
+    "traces",
     "workers",
     "workflows",
 ]

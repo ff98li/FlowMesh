@@ -56,6 +56,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from shared.schemas.governance import SpanType
 from shared.tasks.specs import (
     EmbeddingSpecStrict,
     InferenceSpecStrict,
@@ -67,7 +68,11 @@ from ..utils.logging import configure_hf_library_logging
 from .base_executor import ExecutionError, Executor, ExecutorTask
 from .mixins.data import InferenceEntry
 from .mixins.inference import InferenceMixin
-from .utils.checkpoints import artifact_ref, maybe_upload_artifacts
+from .utils.checkpoints import (
+    artifact_ref,
+    maybe_upload_artifacts,
+    maybe_upload_traces,
+)
 
 try:
     import torch
@@ -392,7 +397,22 @@ class HFTransformersExecutor(InferenceMixin, Executor):
                 f"{spec.__class__.__name__}"
             )
         task_id = task.task_id
-        self._ensure_model(spec)
+        with self._task_span(
+            task_id, task.workflow_id, out_dir, owner_id=task.owner_id
+        ):
+            result = self._run_inner(spec, task_id, out_dir)
+        maybe_upload_artifacts(task, out_dir, logger=logger)
+        maybe_upload_traces(task, out_dir, logger=logger)
+        return result
+
+    def _run_inner(
+        self,
+        spec: "InferenceSpecStrict | EmbeddingSpecStrict",
+        task_id: str,
+        out_dir: Path,
+    ) -> dict[str, Any]:
+        with self._span("model load", span_type=SpanType.COMPUTE):
+            self._ensure_model(spec)
 
         deps = self._extract_source_data_ids(spec)
         dependencies_by_task = {task_id: deps}
@@ -473,15 +493,11 @@ class HFTransformersExecutor(InferenceMixin, Executor):
             if image_group_sizes is not None:
                 result["image_group_sizes"] = image_group_sizes
 
-            maybe_upload_artifacts(task, out_dir, logger=logger)
-
-            if governance_spec := spec.governance:
-                self._dump_to_governance(
-                    governance_spec=governance_spec,
-                    task_id=task_id,
-                    result=result,
-                    dependencies_by_task=dependencies_by_task,
-                )
+            self._dump_to_governance(
+                task_id=task_id,
+                result=result,
+                dependencies_by_task=dependencies_by_task,
+            )
 
             return result
 
@@ -513,23 +529,28 @@ class HFTransformersExecutor(InferenceMixin, Executor):
         enc = {k: v.to(device) for k, v in enc.items()}  # type: ignore[arg-type]
 
         t0 = time.time()
-        with torch.no_grad():
-            try:
-                outputs = self._model.generate(  # type: ignore
-                    **enc, generation_config=gen_cfg
-                )
-            except ValueError as exc:
-                if not (stops and "stop" in str(exc).lower()):
-                    raise
-                logger.warning(
-                    "Falling back to decoded stop-string truncation after native "
-                    "stop configuration failed: %s",
-                    exc,
-                )
-                gen_cfg = self._build_generation_config(self._inf, stop_strings=[])
-                outputs = self._model.generate(  # type: ignore
-                    **enc, generation_config=gen_cfg
-                )
+        with self._span(
+            "generation",
+            span_type=SpanType.COMPUTE,
+            attributes={"prompt_count": len(self._prompts)},
+        ):
+            with torch.no_grad():
+                try:
+                    outputs = self._model.generate(  # type: ignore
+                        **enc, generation_config=gen_cfg
+                    )
+                except ValueError as exc:
+                    if not (stops and "stop" in str(exc).lower()):
+                        raise
+                    logger.warning(
+                        "Falling back to decoded stop-string truncation after "
+                        "native stop configuration failed: %s",
+                        exc,
+                    )
+                    gen_cfg = self._build_generation_config(self._inf, stop_strings=[])
+                    outputs = self._model.generate(  # type: ignore
+                        **enc, generation_config=gen_cfg
+                    )
         latency = time.time() - t0
 
         items: list[dict[str, Any]] = []
@@ -591,15 +612,11 @@ class HFTransformersExecutor(InferenceMixin, Executor):
 
         if isinstance(spec, InferenceSpecStrict):
             self._maybe_export_jsonl(spec, task_id, result, out_dir)
-        maybe_upload_artifacts(task, out_dir, logger=logger)
 
-        # Dump execution result to GovernanceRelay
-        if governance_spec := spec.governance:
-            self._dump_to_governance(
-                governance_spec=governance_spec,
-                task_id=task_id,
-                result=result,
-                dependencies_by_task=dependencies_by_task,
-            )
+        self._dump_to_governance(
+            task_id=task_id,
+            result=result,
+            dependencies_by_task=dependencies_by_task,
+        )
 
         return result

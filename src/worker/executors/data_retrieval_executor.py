@@ -16,7 +16,11 @@ from ..connectors import PostgreSQLConnector, S3Connector
 from ..utils.serialization import serialize_dataframe
 from .base_executor import ExecutionError, Executor, ExecutorTask
 from .mixins.data import DataMixin
-from .utils.checkpoints import artifact_ref, maybe_upload_artifacts
+from .utils.checkpoints import (
+    artifact_ref,
+    maybe_upload_artifacts,
+    maybe_upload_traces,
+)
 from .utils.graph_templates import _render_template, _resolve_columns
 
 logger = logging.getLogger(__name__)
@@ -28,37 +32,38 @@ class DataRetrievalExecutor(DataMixin, Executor):
     def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
         spec = self.require_spec(task, DataRetrievalSpecStrict)
         task_id = task.task_id
-        data_cfg = spec.data
-        if not isinstance(data_cfg, dict):
-            raise ExecutionError("spec.data must be a mapping for data_retrieval.")
-        retrieval_type = data_cfg.get("type")
-        if retrieval_type not in {"sql", "s3"}:
-            raise ExecutionError(
-                "spec.data.type must be either 'sql' or 's3' for data_retrieval."
-            )
-        context = spec.upstreamResults or {}
+        with self._task_span(
+            task_id, task.workflow_id, out_dir, owner_id=task.owner_id
+        ):
+            data_cfg = spec.data
+            if not isinstance(data_cfg, dict):
+                raise ExecutionError("spec.data must be a mapping for data_retrieval.")
+            retrieval_type = data_cfg.get("type")
+            if retrieval_type not in {"sql", "s3"}:
+                raise ExecutionError(
+                    "spec.data.type must be either 'sql' or 's3' for data_retrieval."
+                )
+            context = spec.upstreamResults or {}
 
-        if retrieval_type == "sql":
-            result = self._run_sql(data_cfg, context)
-        elif retrieval_type == "s3":
-            result = self._run_s3(data_cfg, context, out_dir)
-        else:
-            raise ExecutionError(
-                f"Unsupported data_retrieval type: {retrieval_type!r}."
-            )
+            if retrieval_type == "sql":
+                result = self._run_sql(data_cfg, context)
+            elif retrieval_type == "s3":
+                result = self._run_s3(data_cfg, context, out_dir)
+            else:
+                raise ExecutionError(
+                    f"Unsupported data_retrieval type: {retrieval_type!r}."
+                )
 
-        maybe_upload_artifacts(task, out_dir, logger=logger)
-
-        if governance_spec := spec.governance:
             deps = self._extract_source_data_ids(spec)
             dependencies_by_task = {task_id: deps}
             self._dump_to_governance(
-                governance_spec=governance_spec,
                 task_id=task_id,
                 result=result,
                 dependencies_by_task=dependencies_by_task,
             )
 
+        maybe_upload_artifacts(task, out_dir, logger=logger)
+        maybe_upload_traces(task, out_dir, logger=logger)
         return result
 
     def _run_sql(

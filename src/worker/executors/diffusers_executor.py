@@ -21,7 +21,11 @@ from worker.lifecycle import Lifecycle
 from ..utils.logging import configure_hf_library_logging
 from .base_executor import ExecutionError, Executor, ExecutorTask
 from .mixins.data import DataMixin
-from .utils.checkpoints import artifact_ref, maybe_upload_artifacts
+from .utils.checkpoints import (
+    artifact_ref,
+    maybe_upload_artifacts,
+    maybe_upload_traces,
+)
 
 try:
     import torch
@@ -244,6 +248,20 @@ class DiffusersExecutor(DataMixin, Executor):
         configure_hf_library_logging()
         spec = self.require_spec(task, DiffusionSpecStrict)
         task_id = task.task_id.strip()
+        with self._task_span(
+            task_id, task.workflow_id, out_dir, owner_id=task.owner_id
+        ):
+            response = self._run_inner(spec, task_id, out_dir)
+        maybe_upload_artifacts(task, out_dir, logger=logger)
+        maybe_upload_traces(task, out_dir, logger=logger)
+        return response
+
+    def _run_inner(
+        self,
+        spec: DiffusionSpecStrict,
+        task_id: str,
+        out_dir: Path,
+    ) -> dict[str, Any]:
         self._ensure_pipeline(spec)
         assert self._pipe is not None
 
@@ -333,15 +351,11 @@ class DiffusersExecutor(DataMixin, Executor):
             "images": generated_images,
         }
 
-        maybe_upload_artifacts(task, out_dir, logger=logger)
-
-        if governance_spec := spec.governance:
-            self._dump_to_governance(
-                governance_spec=governance_spec,
-                task_id=task_id,
-                result=response,
-                dependencies_by_task=dependencies_by_task,
-            )
+        self._dump_to_governance(
+            task_id=task_id,
+            result=response,
+            dependencies_by_task=dependencies_by_task,
+        )
 
         return response
 

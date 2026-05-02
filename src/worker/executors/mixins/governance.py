@@ -1,357 +1,295 @@
+"""Worker mixin: OTel span emission + asset/lineage JSONL row writes."""
+
+import contextvars
 import json
 import logging
-import tempfile
 import threading
-from collections import defaultdict
+import uuid
+from collections.abc import Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
-from threading import Lock
 from typing import Any
 
-import requests
+from opentelemetry.trace import Span as OTelSpan
 
-from shared.utils.json import dedup_json, restore_json
+from shared.schemas.governance import (
+    READY_SPAN_NAME,
+    TASK_SPAN_NAME,
+    SpanType,
+)
+from shared.tasks.specs import TaskSpecStrictBase
 from shared.utils.time import now_iso
 
 from ..base_executor import ExecutionError
+from ._otel import attributes_with_type, get_tracer, task_trace_context
 
 logger = logging.getLogger(__name__)
 
 
 class GovernanceMixin:
-    """
-    Mixin for governance-related operations in FlowMesh.
-
-    This class provides functionality for tracking events, caching governance data,
-    and interfacing with external governance APIs for data read/write operations.
-    It maintains an event log for audit trails and implements caching mechanisms
-    to optimize repeated data fetch operations.
-
-    Attributes:
-        _event_log: Thread-safe dictionary storing event logs keyed by data_id
-        _current_batch_id: Current batch identifier for grouping related operations
-        _event_lock: Threading lock for synchronizing event log access
-        _cache_dir: Directory path for caching governance API responses
-    """
+    """OTel span emission + asset / lineage JSONL row writes."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._task_id: str | None = None
-        self._event_log: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._task_out_dir: Path | None = None
         self._current_batch_id: str | None = None
+        self._task_owner_id: str = ""
         self._event_lock = threading.Lock()
-        self._cache_dir = Path(tempfile.gettempdir()) / "flowmesh_governance_cache"
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
-        self._cache_dir_lock = Lock()
+        self.io_executor = ThreadPoolExecutor(max_workers=32)
 
-    # events related methods
-    def _clear_events(self) -> None:
-        """
-        Clear all events from the event log.
+    def _submit_in_context(self, fn: Any, *args: Any, **kwargs: Any) -> Future[Any]:
+        """``io_executor.submit`` that carries the caller's ContextVars across."""
+        ctx = contextvars.copy_context()
+        return self.io_executor.submit(ctx.run, fn, *args, **kwargs)
 
-        Thread-safe operation that removes all logged events from memory.
-        This is typically called when starting a new batch of operations.
-        """
-        with self._event_lock:
-            self._event_log.clear()
+    # ------------------------------------------------------------------ #
+    # Span emission — context managers driven by the OTel SDK            #
+    # ------------------------------------------------------------------ #
+    @contextmanager
+    def _task_span(
+        self,
+        task_id: str,
+        workflow_id: str,
+        out_dir: Path,
+        *,
+        owner_id: str = "",
+    ) -> Iterator[OTelSpan]:
+        """Root span for a task — wraps the executor's ``run()`` body."""
+        self._task_id = task_id
+        self._current_batch_id = task_id
+        self._task_out_dir = Path(out_dir)
+        self._task_owner_id = owner_id
+        spans_path = self._lineage_dir() / "spans.jsonl"
+        spans_path.parent.mkdir(parents=True, exist_ok=True)
+        with task_trace_context(workflow_id, spans_path):
+            with get_tracer().start_as_current_span(
+                TASK_SPAN_NAME,
+                attributes=attributes_with_type(
+                    SpanType.COMPUTE,
+                    data_id=task_id,
+                    extra={
+                        "batch_id": task_id,
+                        "workflow_id": workflow_id,
+                        "user_id": owner_id,
+                        "executor.name": getattr(self, "name", None),
+                    },
+                ),
+            ) as span:
+                yield span
+
+    @contextmanager
+    def _span(
+        self,
+        name: str,
+        *,
+        span_type: SpanType = SpanType.COMPUTE,
+        data_id: str | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> Iterator[OTelSpan]:
+        """Child span recording start at __enter__, end at __exit__."""
+        attrs = attributes_with_type(
+            span_type,
+            data_id=data_id if data_id is not None else self._task_id,
+            extra={"batch_id": self._current_batch_id, **(attributes or {})},
+        )
+        with get_tracer().start_as_current_span(name, attributes=attrs) as span:
+            yield span
 
     def _log_event(
         self,
-        data_id: str = "",
-        event_type: str = "",
-        event_data: str = "",
-        timestamp: str | None = None,
+        name: str,
+        *,
+        span_type: SpanType = SpanType.MARKER,
+        data_id: str | None = None,
+        attributes: dict[str, Any] | None = None,
     ) -> None:
-        """
-        Log an event to the event log for tracking and audit purposes.
+        """Record a moment-in-time checkpoint as a zero-duration span."""
+        attrs = attributes_with_type(
+            span_type,
+            data_id=data_id if data_id is not None else self._task_id,
+            extra={"batch_id": self._current_batch_id, **(attributes or {})},
+        )
+        with get_tracer().start_as_current_span(name, attributes=attrs):
+            pass
 
-        Args:
-            data_id: Identifier for the data associated with this event.
-                    If empty, uses the current task_id (must be set).
-            event_type: Type/category of the event (required).
-            event_data: Additional data or context for the event.
-            timestamp: ISO format timestamp for the event. If None, uses current
-                       UTC time.
+    # ------------------------------------------------------------------ #
+    # Asset / lineage rows — keep their own JSONL files                  #
+    # ------------------------------------------------------------------ #
+    def _lineage_dir(self) -> Path:
+        """Per-task ``logs/`` directory; requires an active ``_task_span``."""
+        if self._task_out_dir is None:
+            raise ExecutionError(
+                "Lineage directory accessed before _task_span entered; "
+                "wrap executor work in `with self._task_span(...)`."
+            )
+        return self._task_out_dir / "logs"
 
-        Raises:
-            ExecutionError: If event_type is not provided.
-            AssertionError: If data_id is not provided and task_id is not set.
+    def _append_jsonl(self, filename: str, row: dict[str, Any]) -> None:
+        target_dir = self._lineage_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(row, ensure_ascii=False, default=str)
+        path = target_dir / filename
+        with self._event_lock:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
 
-        The event is stored thread-safely in the event log with the current batch_id.
-        """
-        if not data_id:
-            assert (
-                self._task_id is not None
-            ), "data_id must be provided if task_id is not set"
-            data_id = self._task_id
-        if not event_type:
-            raise ExecutionError("event_type must be provided")
-        ts_value = timestamp or now_iso()
-        event_entry = {
-            "event_type": event_type,
-            "event_data": event_data,
-            "timestamp": ts_value,
-            "batch_id": self._current_batch_id,
+    def _record_asset(
+        self,
+        data_id: str,
+        asset_guid: str,
+        version: int = 1,
+        user_id: str = "",
+        created_at: str | None = None,
+    ) -> None:
+        row = {
+            "data_id": data_id,
+            "asset_guid": asset_guid,
+            "version": version,
+            "user_id": user_id,
+            "created_at": created_at or now_iso(),
         }
-        with self._event_lock:
-            self._event_log[data_id].append(event_entry)
-        logger.debug("Logged event for data_id=%s: %s", data_id, event_entry)
+        self._append_jsonl("assets.jsonl", row)
 
-    def _get_events(self) -> dict[str, list[dict[str, Any]]]:
-        """
-        Get a copy of all events in the event log.
-
-        Returns:
-            A dictionary containing all logged events, keyed by data_id.
-            Each value is a list of event entries with event_type, event_data,
-            timestamp, and batch_id information.
-        """
-        with self._event_lock:
-            return dict(self._event_log)
-
-    def _events_for(
-        self, data_ids: list[str] | set[str]
-    ) -> dict[str, list[dict[str, Any]]]:
-        """
-        Return a filtered view of the event log for the given data ids.
-
-        Args:
-            data_ids: List or set of data identifiers to filter events by.
-                     If empty or None, returns an empty dictionary.
-
-        Returns:
-            A dictionary containing only the events for the specified data_ids,
-            with the same structure as the full event log.
-        """
-        wanted = {str(x) for x in (data_ids or [])}
-        if not wanted:
-            return {}
-        with self._event_lock:
-            return {k: v for k, v in self._event_log.items() if k in wanted}
-
-    def _parse_spec(self, governance_spec: dict[str, Any]) -> tuple[str, str, str]:
-        """
-        Parse and validate governance specification dictionary.
-
-        Args:
-            governance_spec: Dictionary containing governance configuration with
-                           required fields: 'url', 'user_id', and 'trace_id'.
-
-        Returns:
-            A tuple of (governance_url, user_id, trace_id) extracted from the spec.
-
-        Raises:
-            ExecutionError: If any required field (url, user_id, trace_id) is missing.
-        """
-        governance_url = governance_spec.get("url")
-        user_id = governance_spec.get("user_id")
-        trace_id = governance_spec.get("trace_id")
-        if not governance_url or not user_id or not trace_id:
-            raise ExecutionError(
-                f"Governance spec missing required fields: {governance_spec}"
-            )
-        return governance_url, user_id, trace_id
-
-    def _fetch_data(
-        self, data_id: str, governance_spec: dict[str, Any]
-    ) -> dict[str, Any]:
-        """
-        Fetch data from governance API with caching support.
-
-        This method attempts to retrieve data from a local cache first, and if not found
-        or expired, makes an HTTP request to the governance API. It logs various events
-        throughout the process for audit trails.
-
-        Args:
-            data_id: Unique identifier for the data to fetch.
-            governance_spec: Dictionary containing governance configuration with
-                           'url', 'user_id', and 'trace_id' fields.
-
-        Returns:
-            The retrieved data as a dictionary, restored from JSON format.
-
-        Raises:
-            ExecutionError: If the API request fails, response parsing fails,
-                          or trace_id validation fails.
-
-        Notes:
-            - Caches responses to avoid redundant API calls
-            - Validates that trace_id matches to prevent cross-workflow data access
-            - Logs multiple events: request initiation, cache hits, transfers,
-              decoding, and caching
-        """
-        governance_url, user_id, trace_id = self._parse_spec(governance_spec)
-        try:
-            self._log_event(
-                data_id=data_id,
-                event_type="read request initiated",
-                timestamp=now_iso(),
-            )
-            cache_path = self._cache_dir / f"{data_id}-{user_id}-{trace_id}.json"
-            logger.debug(
-                "Governance read: data_id=%s user_id=%s trace_id=%s cache=%s",
-                data_id,
-                user_id,
-                trace_id,
-                cache_path.as_posix(),
-            )
-            with self._cache_dir_lock:
-                if cache_path.exists():
-                    with open(cache_path, encoding="utf-8") as f:
-                        cached = json.load(f)
-                    self._log_event(
-                        data_id=data_id,
-                        event_type="read cache hit",
-                        timestamp=now_iso(),
-                        event_data="Using cached upstream result",
-                    )
-                    return cached
-
-            api_url = governance_url.rstrip("/") + "/api/read"
-            params = {
-                "data_id": data_id,
-                "user_id": user_id,
-            }
-            logger.debug(
-                "Governance read request: url=%s params=%s",
-                api_url,
-                params,
-            )
-            response = requests.get(api_url, params=params, timeout=30)
-            if response.status_code >= 400:
-                logger.warning(
-                    "Governance read failed (status %s): %s",
-                    response.status_code,
-                    response.text[:200],
-                )
-            response.raise_for_status()
-
-            self._log_event(
-                data_id=data_id,
-                event_type="read response transfer",
-                timestamp=now_iso(),
+    def _record_lineage(
+        self,
+        data_id: str,
+        source_data_ids: Sequence[str],
+        created_at: str | None = None,
+    ) -> None:
+        ts = created_at or now_iso()
+        for source_data_id in source_data_ids:
+            self._append_jsonl(
+                "lineage.jsonl",
+                {
+                    "data_id": data_id,
+                    "source_data_id": source_data_id,
+                    "created_at": ts,
+                },
             )
 
-            read_response = response.json()
-            # Extract required fields from ReadResponse
-            retrieved_data = restore_json(json.loads(read_response["data"]))
-            assert (
-                trace_id == read_response["trace_id"]
-            ), "One workflow should not access data from another workflow"
-
-            self._log_event(
-                data_id=data_id,
-                event_type="read response decoding",
-                timestamp=now_iso(),
-            )
-
-            with self._cache_dir_lock:
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    json.dump(retrieved_data, f, ensure_ascii=False)
-
-            self._log_event(
-                data_id=data_id,
-                event_type="read response cache write",
-                timestamp=now_iso(),
-            )
-            logger.info(
-                "Written data %s to cache at %s upon first read",
-                data_id,
-                cache_path.as_posix(),
-            )
-        except Exception as exc:
-            raise ExecutionError(
-                f"Error fetching upstream result {data_id}: {exc}"
-            ) from exc
-
-        return retrieved_data
-
-    def _write_data(
+    def _record_output(
         self,
         data_id: str,
         data: Any,
         source_data_ids: list[str],
-        governance_spec: dict[str, Any],
-        events: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
-        """
-        Write data to governance API with event tracking.
+        """Emit asset + lineage rows; ``data`` is only serialized to size the
+        ``"dump to storage"`` span (runtime does not upload payloads)."""
+        with self._span(
+            READY_SPAN_NAME, span_type=SpanType.NETWORK, data_id=data_id
+        ) as dump_span:
+            try:
+                payload = json.dumps(data, ensure_ascii=False, default=str)
+            except (TypeError, ValueError) as exc:
+                raise ExecutionError(
+                    f"Failed to serialize data {data_id}: {exc}"
+                ) from exc
 
-        This method prepares and sends data to the governance API, including
-        associated events and metadata. It handles data deduplication and
-        provides comprehensive logging for the operation.
+            payload_bytes = len(payload.encode("utf-8"))
+            dump_span.set_attribute("payload_bytes", payload_bytes)
 
-        Args:
-            data_id: Unique identifier for the data being written.
-            data: The data to write (will be JSON serialized).
-            source_data_ids: List of data IDs that this data depends on or sources from.
-            governance_spec: Dictionary containing governance configuration with
-                           'url', 'user_id', and 'trace_id' fields.
-            events: Optional dictionary of events to include. If None, automatically
-                   collects events for data_id and source_data_ids.
-
-        Returns:
-            None. Logs success or warning messages based on API response.
-
-        Notes:
-            - Automatically deduplicates JSON data before sending
-            - Includes relevant events for audit trails
-            - Handles 4xx/5xx responses gracefully with warnings
-            - Logs request preparation and success with data size metrics
-        """
-        governance_url, user_id, trace_id = self._parse_spec(governance_spec)
-        cache_path = self._cache_dir / f"{data_id}-{user_id}-{trace_id}.json"
-        request_data = {
-            "data_id": data_id,
-            "user_id": user_id,
-            "trace_id": trace_id,
-            "data": json.dumps(dedup_json(data), ensure_ascii=False),
-            "source_data_ids": source_data_ids or [],
-            "events": (
-                events
-                if events is not None
-                else self._events_for([data_id, *(source_data_ids or [])])
-            ),
-            "batch_id": self._current_batch_id,
-        }
-        self._log_event(
-            data_id=data_id,
-            event_type="write request preparation",
-            timestamp=now_iso(),
-        )
-
-        # Write to cache
-        with self._cache_dir_lock:
-            assert not cache_path.exists(), "Cache path should not exist before writing"
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
-        self._log_event(
-            data_id=data_id,
-            event_type="write request cache write",
-            timestamp=now_iso(),
-        )
-        logger.info(
-            "Written data %s to cache at %s during governance write",
-            data_id,
-            cache_path.as_posix(),
-        )
-
-        # Send to governance API
-        api_url = governance_url.rstrip("/") + "/api/write"
-        response = requests.post(api_url, json=request_data, timeout=300)
-
-        if response.status_code >= 400:
-            logger.warning(
-                "Governance dump failed for data %s (status %s): %s",
-                data_id,
-                response.status_code,
-                response.text[:200],
+            asset_guid = (
+                source_data_ids[0] if len(source_data_ids) == 1 else str(uuid.uuid4())
             )
-            return
-
+            self._record_asset(
+                data_id=data_id,
+                asset_guid=asset_guid,
+                version=1,
+                user_id=self._task_owner_id,
+            )
+            if source_data_ids:
+                self._record_lineage(data_id=data_id, source_data_ids=source_data_ids)
         logger.info(
-            "Dumped execution result for data %s to governance "
-            "(size: %d bytes, items: %d)",
+            "Wrote lineage for %s (size: %d bytes, sources: %d)",
             data_id,
-            len(json.dumps(request_data, ensure_ascii=False).encode("utf-8")),
-            len(data.get("items", [])),
+            payload_bytes,
+            len(source_data_ids),
         )
+
+    @staticmethod
+    def _spec_upstream_results(spec: TaskSpecStrictBase) -> dict[str, Any]:
+        """Validated ``spec._upstreamResults`` (server-injected stage context)."""
+        context = spec.upstreamResults or {}
+        if not isinstance(context, dict):
+            raise ExecutionError("spec._upstreamResults must be a mapping.")
+        return context
+
+    def _extract_source_data_ids(self, spec: TaskSpecStrictBase) -> list[str]:
+        """Extract upstream task/data IDs from ``_upstreamResults`` for lineage."""
+        seen: set[str] = set()
+        ids: list[str] = []
+        for upstream in self._spec_upstream_results(spec).values():
+            if not isinstance(upstream, dict):
+                continue
+            candidate = upstream.get("task_id") or upstream.get("data_id")
+            if candidate is None:
+                continue
+            sid = str(candidate)
+            if sid in seen:
+                continue
+            seen.add(sid)
+            ids.append(sid)
+        return ids
+
+    def _dump_to_governance(
+        self,
+        task_id: str,
+        result: dict[str, Any],
+        dependencies_by_task: dict[str, list[str]],
+    ) -> None:
+        """Write parent + merged-child results and emit asset/lineage rows."""
+        parent_deps = dependencies_by_task.get(task_id, [])
+        children_payload = result.get("children", {})
+
+        collection_jobs: list[dict[str, Any]] = [
+            {
+                "task_id": task_id,
+                "result": result,
+                "deps": parent_deps,
+                "is_parent": True,
+            }
+        ]
+        for child_id, child_result in children_payload.items():
+            child_deps = dependencies_by_task.get(child_id, [])
+            collection_jobs.append(
+                {
+                    "task_id": child_id,
+                    "result": child_result,
+                    "deps": child_deps,
+                    "is_parent": False,
+                }
+            )
+
+        if len(collection_jobs) == 1:
+            job = collection_jobs[0]
+            self._record_output(
+                data_id=job["task_id"],
+                data=job["result"],
+                source_data_ids=job["deps"],
+            )
+        else:
+            logger.info(
+                "Recording lineage for %d merged tasks in parallel",
+                len(collection_jobs),
+            )
+            future_map = {
+                self._submit_in_context(
+                    self._record_output,
+                    data_id=job["task_id"],
+                    data=job["result"],
+                    source_data_ids=job["deps"],
+                ): job
+                for job in collection_jobs
+            }
+            for future in as_completed(future_map):
+                job = future_map[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    if job["is_parent"]:
+                        raise
+                    raise ExecutionError(
+                        f"Failed to write merged child task {job['task_id']}: {exc}"
+                    ) from exc
