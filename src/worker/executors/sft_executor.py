@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """SFT executor powered by TRL's SFTTrainer/SFTConfig.
 
-This implementation launches single-GPU runs in-process and spawns multi-GPU
-tasks via ``torchrun``. DeepSpeed is used for multi-GPU orchestration when a
-DeepSpeed configuration is provided in the training spec.
+Single-GPU runs execute in-process. Multi-GPU runs go through
+``torch.distributed.run.main`` (the same entry point ``torchrun`` calls),
+or through ``deepspeed.launcher.runner.main`` when a DeepSpeed configuration
+is supplied and the ``deepspeed`` package is importable.
 """
 
 import gc
 import json
 import logging
 import os
-import shutil
-import subprocess  # nosec B404 — TODO: replace torchrun shellout with in-process torch.distributed.run.main
 import tempfile
 import time
 from pathlib import Path
@@ -39,6 +38,7 @@ from .utils.checkpoints import (
     maybe_upload_artifacts,
 )
 from .utils.data_utils import resolve_jsonl_path
+from .utils.distributed import deepspeed_available, run_deepspeed, run_torchrun
 from .utils.huggingface import build_hf_load_kwargs, pick_torch_dtype
 
 logger = logging.getLogger("worker.sft")
@@ -154,54 +154,42 @@ class SFTExecutor(TrainingMixin, Executor):
                 launcher_dir = scratch_dir(out_dir) / "launcher"
                 launcher_dir.mkdir(parents=True, exist_ok=True)
                 task_file = launcher_dir / "task_spec.json"
-                with task_file.open("w") as fh:
-                    json.dump(task, fh)
+                with task_file.open("w", encoding="utf-8") as fh:
+                    fh.write(task.model_dump_json(by_alias=True))
 
                 nproc = int(training_cfg.get("nproc_per_node", n_gpus))
-                use_deepspeed_cli = deepspeed_intent and shutil.which("deepspeed")
-                if deepspeed_intent and not use_deepspeed_cli:
+                use_deepspeed = deepspeed_intent and deepspeed_available()
+                if deepspeed_intent and not use_deepspeed:
                     logger.warning(
-                        "DeepSpeed configuration provided but `deepspeed` CLI not "
-                        "found; falling back to torchrun."
+                        "DeepSpeed configuration provided but the `deepspeed` "
+                        "package is not importable; falling back to torchrun."
                     )
-                if use_deepspeed_cli:
-                    cmd = [
-                        "deepspeed",
-                        "--num_gpus",
-                        str(nproc),
-                        "--module",
-                        "worker.executors.sft_dist_entry",
-                        task_file.as_posix(),
-                        out_dir.as_posix(),
-                    ]
+                if use_deepspeed:
+                    logger.info(
+                        "Launching DeepSpeed for SFT "
+                        "(num_gpus=%d, CUDA_VISIBLE_DEVICES=%s)",
+                        nproc,
+                        os.environ.get("CUDA_VISIBLE_DEVICES"),
+                    )
+                    run_deepspeed(
+                        num_gpus=nproc,
+                        module="worker.executors.sft_dist_entry",
+                        module_args=[task_file.as_posix(), out_dir.as_posix()],
+                        launcher_env_flag=launcher_env_flag,
+                    )
                 else:
-                    cmd = [
-                        "torchrun",
-                        "--nproc_per_node",
-                        str(nproc),
-                        "-m",
-                        "worker.executors.sft_dist_entry",
-                        task_file.as_posix(),
-                        out_dir.as_posix(),
-                    ]
-                env = os.environ.copy()
-                env[launcher_env_flag] = "1"
-                # Ensure repo root on PYTHONPATH so `worker.executors.*` is importable
-                try:
-                    repo_root = Path(__file__).resolve().parents[2]
-                    env["PYTHONPATH"] = f"{repo_root.as_posix()}:" + env.get(
-                        "PYTHONPATH", ""
+                    logger.info(
+                        "Launching torchrun for SFT "
+                        "(nproc=%d, CUDA_VISIBLE_DEVICES=%s)",
+                        nproc,
+                        os.environ.get("CUDA_VISIBLE_DEVICES"),
                     )
-                except Exception:
-                    pass
-                launcher_name = "DeepSpeed" if use_deepspeed_cli else "torchrun"
-                logger.info(
-                    "Spawning %s for SFT: %s (CUDA_VISIBLE_DEVICES=%s)",
-                    launcher_name,
-                    " ".join(cmd),
-                    env.get("CUDA_VISIBLE_DEVICES"),
-                )
-                subprocess.check_call(cmd, env=env)
+                    run_torchrun(
+                        nproc_per_node=nproc,
+                        module="worker.executors.sft_dist_entry",
+                        module_args=[task_file.as_posix(), out_dir.as_posix()],
+                        launcher_env_flag=launcher_env_flag,
+                    )
                 ipc_path = scratch_dir(out_dir) / "distributed_result.json"
                 if ipc_path.exists():
                     distributed_result = self.load_json(ipc_path)
