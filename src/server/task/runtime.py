@@ -706,10 +706,10 @@ class TaskRuntime:
         worker_id: str | None,
         payload: dict[str, Any],
         ts: str,
-    ) -> tuple[list[str], list[str], list[tuple[str, TaskUsage]]]:
+    ) -> list[tuple[str, TaskUsage]]:
         """
         Mark a task as completed and enqueue any dependents that have become ready.
-        Returns (ready_children, merged_children_ids, usages).
+        Returns the per-task usage rows produced by the completion.
         """
         finished_ts = parse_iso_ts(str(payload.get("finished_at") or ts))
         maybe_started = payload.get("started_at")
@@ -724,7 +724,7 @@ class TaskRuntime:
             record = self._tasks.get(task_id)
             if record:
                 if record.status == TaskStatus.CANCELLED:
-                    return [], [], usages
+                    return usages
                 record.status = TaskStatus.DONE
                 record.error = None
                 record.finished_ts = finished_ts
@@ -775,7 +775,7 @@ class TaskRuntime:
             if ready_children:
                 self._cv.notify_all()
 
-            return ready_children, merged_children_ids, usages
+            return usages
 
     def mark_failed(
         self,
@@ -982,6 +982,11 @@ class TaskRuntime:
     def get_record(self, task_id: str) -> TaskRecord | None:
         with self._lock:
             return self._tasks.get(task_id)
+
+    def get_merged_children(self, task_id: str) -> list[str]:
+        """Read the merged-children list without consuming it."""
+        with self._cv:
+            return self._merge_children_map.get(task_id, [])
 
     def describe_task(self, task_id: str) -> TaskInfo | None:
         with self._lock:
