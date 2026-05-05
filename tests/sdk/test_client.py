@@ -1,10 +1,14 @@
 """Client construction and configuration tests."""
 
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from flowmesh import AsyncFlowMesh, FlowMesh, FlowMeshConfig
+from flowmesh import AsyncFlowMesh, ConfigInvalidError, FlowMesh, FlowMeshConfig
+from flowmesh.client import resolve_config
+
+from .helpers import clear_env_and_config_file
 
 _EXPECTED_RESOURCES = [
     "results",
@@ -53,11 +57,9 @@ class TestFlowMeshClient:
             assert client.api_key == "flm-explicit"
 
     def test_default_base_url(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            for key in ("FLOWMESH_BASE_URL", "FLOWMESH_API_KEY"):
-                os.environ.pop(key, None)
+        with clear_env_and_config_file():
             client = FlowMesh()
-            assert "localhost" in client.base_url or "8000" in client.base_url
+        assert "localhost" in client.base_url or "8000" in client.base_url
 
     def test_context_manager(self) -> None:
         with FlowMesh(base_url="http://localhost:8000") as client:
@@ -105,11 +107,9 @@ class TestAsyncFlowMeshClient:
             assert client.api_key == "flm-explicit"
 
     def test_default_base_url(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            for key in ("FLOWMESH_BASE_URL", "FLOWMESH_API_KEY"):
-                os.environ.pop(key, None)
+        with clear_env_and_config_file():
             client = AsyncFlowMesh()
-            assert "localhost" in client.base_url or "8000" in client.base_url
+        assert "localhost" in client.base_url or "8000" in client.base_url
 
     @pytest.mark.anyio
     async def test_context_manager(self) -> None:
@@ -139,3 +139,51 @@ class TestFlowMeshConfig:
             os.environ.pop("FLOWMESH_BASE_URL", None)
             with pytest.raises(Exception):
                 FlowMeshConfig.from_env()
+
+    def test_from_env_no_api_key_returns_none(self) -> None:
+        with patch.dict(
+            os.environ, {"FLOWMESH_BASE_URL": "http://cfg-host:8000"}, clear=True
+        ):
+            cfg = FlowMeshConfig.from_env()
+            assert cfg.api_key is None
+
+    def test_from_mapping_empty_base_url_raises(self) -> None:
+        with pytest.raises(ConfigInvalidError):
+            FlowMeshConfig.from_mapping({"base_url": ""})
+
+
+class TestResolveConfig:
+    def test_both_env_vars_skips_file(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            'base_url = "http://file-host:8000"\napi_key = "file-key"\n'
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "FLOWMESH_BASE_URL": "http://env-host:8000",
+                "FLOWMESH_API_KEY": "env-key",
+            },
+            clear=True,
+        ):
+            cfg = resolve_config(config_path=config_file)
+
+        assert cfg.base_url == "http://env-host:8000"
+        assert cfg.api_key == "env-key"
+
+    def test_base_url_env_merges_api_key_from_file(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            'base_url = "http://file-host:8000"\napi_key = "file-key"\n'
+        )
+
+        with patch.dict(
+            os.environ,
+            {"FLOWMESH_BASE_URL": "http://env-host:8000"},
+            clear=True,
+        ):
+            cfg = resolve_config(config_path=config_file)
+
+        assert cfg.base_url == "http://env-host:8000"
+        assert cfg.api_key == "file-key"
