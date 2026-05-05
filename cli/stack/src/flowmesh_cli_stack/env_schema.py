@@ -400,7 +400,29 @@ STACK_ENV_SCHEMA = EnvSchema(
                     var_type=EnvVarType.FLOAT,
                     min_value=0.0,
                 ),
-                EnvVar("RESULTS_DIR", var_type=EnvVarType.DIR_PATH),
+                EnvVar(
+                    "SERVER_RESULTS_DIR",
+                    "flowmesh_results",
+                    var_type=EnvVarType.DIR_PATH,
+                    description=[
+                        "Directory/Docker volume for the server to look up task "
+                        "results after worker completion.",
+                        "Set to the same value as WORKER_RESULTS_DIR so the server "
+                        "can access worker results.",
+                        "For workflows with a local output destination "
+                        '(`spec.output.destination.type="local"`),',
+                        "`SERVER_RESULTS_DIR` and `WORKER_RESULTS_DIR` must point to "
+                        "the same shared directory",
+                        "or volume; otherwise, the server cannot read the worker's "
+                        "outputs and downstream tasks",
+                        "will stall in the dispatching loop.",
+                    ],
+                ),
+                EnvVar(
+                    "WORKER_RESULTS_DIR",
+                    "flowmesh_results",
+                    var_type=EnvVarType.DIR_PATH,
+                ),
                 EnvVar("HF_CACHE_DIR", var_type=EnvVarType.DIR_PATH),
                 EnvVar(
                     "WORKER_NETWORK_BANDWIDTH_BYTES_PER_SEC",
