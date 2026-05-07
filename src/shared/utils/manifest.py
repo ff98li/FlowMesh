@@ -1,26 +1,46 @@
+"""Manifest helpers used by the worker pipeline when persisting outputs."""
+
 import hashlib
 import json
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from .atomic import atomic_write_text
 from .time import now_iso
 
 MANIFEST_NAME = "manifest.json"
 RESULTS_NAME = "results.json"
 LOGS_DIR = "logs"
 ARTIFACTS_DIR = "artifacts"
+SCRATCH_DIR = "scratch"
+
+_SHARED_DIR_MODE = 0o0777
 
 
 def prepare_output_dir(base_dir: Path) -> None:
-    base_dir.mkdir(parents=True, exist_ok=True)
-    (base_dir / LOGS_DIR).mkdir(parents=True, exist_ok=True)
-    (base_dir / ARTIFACTS_DIR).mkdir(parents=True, exist_ok=True)
+    """Ensure the base directory and standard sub-directories exist."""
+    for d in (base_dir, base_dir / LOGS_DIR, base_dir / ARTIFACTS_DIR):
+        if not d.exists():
+            d.mkdir(parents=True)
+            d.chmod(_SHARED_DIR_MODE)
+
+
+def scratch_dir(base_dir: Path) -> Path:
+    """Return `out_dir/scratch/`, creating it if needed."""
+    path = base_dir / SCRATCH_DIR
+    if not path.exists():
+        path.mkdir(parents=True)
+        path.chmod(_SHARED_DIR_MODE)
+    return path
 
 
 def sync_manifest(
     base_dir: Path, task_id: str, expected: Iterable[str]
 ) -> dict[str, Any]:
+    """
+    Build a manifest by reconciling expected versus actual files.
+    """
     prepare_output_dir(base_dir)
     expected_set = {_normalize_artifact_name(item) for item in expected or [] if item}
     expected_set.update({RESULTS_NAME, LOGS_DIR, ARTIFACTS_DIR})
@@ -32,14 +52,14 @@ def sync_manifest(
         rel_path = Path(name)
         entry = _describe_path(base_dir, rel_path, required=True)
         entries.append(entry)
-        added.add(_path_key(rel_path))
+        added.add(rel_path.as_posix())
 
+    # Capture additional files/directories that exist but were not declared.
     for item in base_dir.iterdir():
-        relative = item.relative_to(base_dir)
-        key = _path_key(relative)
+        key = item.relative_to(base_dir).as_posix()
         if key in added or item.name == MANIFEST_NAME:
             continue
-        entry = _describe_path(base_dir, relative, required=False)
+        entry = _describe_path(base_dir, item.relative_to(base_dir), required=False)
         entries.append(entry)
 
     manifest = {
@@ -47,14 +67,16 @@ def sync_manifest(
         "generated_at": now_iso(),
         "entries": entries,
     }
-    (base_dir / MANIFEST_NAME).write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    atomic_write_text(
+        base_dir / MANIFEST_NAME,
+        json.dumps(manifest, ensure_ascii=False, indent=2),
     )
     return manifest
 
 
-def _path_key(path: Path) -> str:
-    return path.as_posix()
+# -------------------------
+# Helpers
+# -------------------------
 
 
 def _infer_type(rel_path: Path) -> str:
@@ -65,6 +87,8 @@ def _infer_type(rel_path: Path) -> str:
         return "logs"
     if normalized.startswith(f"{ARTIFACTS_DIR}/") or normalized == ARTIFACTS_DIR:
         return "artifact"
+    if normalized.startswith(f"{SCRATCH_DIR}/") or normalized == SCRATCH_DIR:
+        return "scratch"
     if rel_path.suffix:
         return "artifact"
     return "directory"

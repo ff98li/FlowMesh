@@ -4,8 +4,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from worker.runner import Runner
-from worker.utils.manifest import (
+from shared.utils.manifest import (
     ARTIFACTS_DIR,
     LOGS_DIR,
     MANIFEST_NAME,
@@ -13,6 +12,7 @@ from worker.utils.manifest import (
     prepare_output_dir,
     sync_manifest,
 )
+from worker.runner import Runner
 
 
 class TestPrepareOutputDir:
