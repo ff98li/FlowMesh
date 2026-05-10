@@ -21,7 +21,13 @@ STACK_ENV_SCHEMA = EnvSchema(
             vars=[
                 EnvVar("FLOWMESH_REGISTRY", "ghcr.io/mlsys-io", required=True),
                 EnvVar("FLOWMESH_VERSION", "dev", required=True),
-                EnvVar("FLOWMESH_CACHE_VERSION"),
+                EnvVar(
+                    "FLOWMESH_CACHE_VERSION",
+                    description=[
+                        "Optional registry cache lineage for stack push.",
+                        "Leave empty to use the default stable cache scope.",
+                    ],
+                ),
                 EnvVar("FLOWMESH_BUILD_REF", "local"),
             ],
         ),
@@ -454,6 +460,16 @@ STACK_ENV_SCHEMA = EnvSchema(
                     "NEBULA_API_BASE_URL",
                     var_type=EnvVarType.URL,
                     url_schemes={"http", "https"},
+                ),
+                EnvVar(
+                    "SERVER_CUDA_PROBE_IMAGE",
+                    "nvidia/cuda:12.9.1-base-ubuntu24.04",
+                    description="Server-side CUDA image used to probe local GPUs.",
+                ),
+                EnvVar(
+                    "DOCKER_GPU_RUNTIME",
+                    "nvidia",
+                    description="Optional Docker runtime name for GPU containers.",
                 ),
                 EnvVar(
                     "CUDA_VISIBLE_DEVICES", "all", var_type=EnvVarType.CSV_INTS_OR_ALL

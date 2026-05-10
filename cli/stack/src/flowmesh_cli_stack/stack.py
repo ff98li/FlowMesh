@@ -1,7 +1,9 @@
 """Stack management commands."""
 
 import os
+import shutil
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -19,7 +21,14 @@ from flowmesh_stack.docker import (
 from flowmesh_stack.doctor import DoctorFinding, run_doctor_checks
 from flowmesh_stack.env import ensure_env_file, load_env
 from flowmesh_stack.env_schema import render_env_example
-from flowmesh_stack.images import BUILD_GROUPS, BUILD_TARGETS, get_image_ref
+from flowmesh_stack.images import (
+    BUILD_GROUPS,
+    BUILD_TARGETS,
+    expand_build_targets,
+    get_cache_ref,
+    get_image_ref,
+    get_push_platforms,
+)
 
 from .env_schema import STACK_ENV_SCHEMA
 from .utils import (
@@ -64,7 +73,87 @@ def _compose(
         raise typer.Exit(code=result.returncode)
 
 
-def _run_bake(mode: str, targets: list[str] | None, env_file: Path) -> None:
+def _resolve_build_targets(batch_targets: list[str]) -> list[str]:
+    resolved: list[str] = []
+    for target in batch_targets:
+        if target in BUILD_GROUPS:
+            resolved.extend(BUILD_GROUPS[target])
+        elif target in BUILD_TARGETS:
+            resolved.append(target)
+    return expand_build_targets(resolved)
+
+
+def _platform_overrides(mode: str, targets: list[str]) -> list[tuple[str, str]]:
+    if mode == "load":
+        return [(target, "local") for target in targets]
+    return [(target, get_push_platforms(target)) for target in targets]
+
+
+def _resolve_bake_batches(
+    targets: list[str] | None, no_builder: bool = False
+) -> list[list[str]]:
+    if targets is None:
+        default_targets = ["server", "workers"]
+        if no_builder:
+            return [default_targets]
+        return [["builders"], default_targets]
+
+    builder_targets = {"builders", "flowmesh_worker_gpu_builder"}
+    if no_builder and any(target in builder_targets for target in targets):
+        logging.error("--no-builder cannot be used with explicit builder targets.")
+        raise typer.Exit(code=1)
+
+    return [targets]
+
+
+def _require_bin(name: str) -> str:
+    path = shutil.which(name)
+    if path is None:
+        logging.error(f"{name} is required but was not found in PATH.")
+        raise typer.Exit(code=1)
+    return path
+
+
+def _parse_buildx_driver(output: str) -> str | None:
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("Driver:"):
+            return line.split(":", 1)[1].strip() or None
+    return None
+
+
+def _ensure_multiplatform_builder_support(docker_bin: str) -> None:
+    inspect = subprocess.run(
+        [
+            docker_bin,
+            "buildx",
+            "inspect",
+        ],  # nosec B603: argv list, absolute binary path.
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if inspect.returncode != 0:
+        return
+    driver = _parse_buildx_driver(inspect.stdout)
+    if driver != "docker":
+        return
+    logging.error("The active buildx builder uses the 'docker' driver.")
+    logging.error(
+        "Multi-platform push requires either the containerd image store or a "
+        "buildx builder that uses the 'docker-container' driver."
+    )
+    logging.log(
+        "Create and select a compatible builder, then retry:\n"
+        "docker buildx create --name flowmesh-multiarch "
+        "--driver docker-container --bootstrap --use"
+    )
+    raise typer.Exit(code=1)
+
+
+def _run_bake(
+    mode: str, targets: list[str] | None, env_file: Path, no_builder: bool = False
+) -> None:
     ensure_env_file(env_file, stack_env_example())
     load_env(env_file, base_dir=Path.cwd(), path_keys=STACK_PATH_KEYS)
 
@@ -73,9 +162,14 @@ def _run_bake(mode: str, targets: list[str] | None, env_file: Path) -> None:
     except DockerError as exc:
         logging.error(str(exc))
         raise typer.Exit(code=1)
+    docker_bin = _require_bin("docker")
 
     buildx_check = subprocess.run(
-        ["docker", "buildx", "version"],
+        [
+            docker_bin,
+            "buildx",
+            "version",
+        ],  # nosec B603: argv list, absolute binary path.
         capture_output=True,
         text=True,
         check=False,
@@ -92,13 +186,13 @@ def _run_bake(mode: str, targets: list[str] | None, env_file: Path) -> None:
     if not bake_file.exists():
         logging.error(f"Bake file not found: {bake_file}")
         raise typer.Exit(code=1)
+    if mode == "push":
+        _ensure_multiplatform_builder_support(docker_bin)
 
-    build_created = (
-        subprocess.check_output(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"]).decode().strip()
-    )
+    build_created = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     registry = os.getenv("FLOWMESH_REGISTRY", "ghcr.io/mlsys-io")
     version = os.getenv("FLOWMESH_VERSION", "dev")
-    cache_version = os.getenv("FLOWMESH_CACHE_VERSION", "").strip() or version
+    cache_version = os.getenv("FLOWMESH_CACHE_VERSION", "").strip() or "cache"
     env = {
         "REGISTRY": registry,
         "VERSION": version,
@@ -106,39 +200,32 @@ def _run_bake(mode: str, targets: list[str] | None, env_file: Path) -> None:
         "BUILD_CREATED": build_created,
     }
 
-    batches: list[list[str]] = []
-    if targets is None:
-        batches = [["builders"], ["server", "workers"]]
-    else:
-        batches = [targets]
-
-    for batch_targets in batches:
-        args = ["docker", "buildx", "bake", "-f", str(bake_file)]
+    for batch_targets in _resolve_bake_batches(targets, no_builder=no_builder):
+        args = [docker_bin, "buildx", "bake", "-f", str(bake_file)]
         if mode == "push":
             args.append("--push")
         else:
             args.append("--load")
         args.extend(batch_targets)
-        args.extend(["--set", "*.args.BUILDKIT_INLINE_CACHE=1"])
 
-        # Resolve cache-from for each target
-        selected_targets: list[str]
-        if batch_targets:
-            selected_targets = []
-            for target in batch_targets:
-                if target in BUILD_GROUPS:
-                    selected_targets.extend(BUILD_GROUPS[target])
-                elif target in BUILD_TARGETS:
-                    selected_targets.append(target)
-                else:
-                    continue
-        else:
-            selected_targets = list(BUILD_TARGETS)
+        selected_targets = _resolve_build_targets(batch_targets)
         for target in selected_targets:
-            image_ref = get_image_ref(registry, cache_version, target)
-            args += ["--set", f"{target}.cache-from=type=registry,ref={image_ref}"]
+            cache_ref = get_cache_ref(registry, cache_version, target)
+            args += ["--set", f"{target}.cache-from=type=registry,ref={cache_ref}"]
+            if mode == "push":
+                args += [
+                    "--set",
+                    f"{target}.cache-to=type=registry,ref={cache_ref},mode=max",
+                ]
+        for target, platform in _platform_overrides(mode, selected_targets):
+            args += ["--set", f"{target}.platform={platform}"]
 
-        result = subprocess.run(args, env={**os.environ, **env}, check=False, text=True)
+        result = subprocess.run(  # nosec B603: argv list, absolute binary path.
+            args,
+            env={**os.environ, **env},
+            check=False,
+            text=True,
+        )
         if result.returncode != 0:
             raise typer.Exit(code=result.returncode)
 
@@ -161,9 +248,14 @@ def build(
     env_file: Path = typer.Option(
         DEFAULT_ENV_FILE, "--env-file", help="Env file for stack compose/bake"
     ),
+    no_builder: bool = typer.Option(
+        False,
+        "--no-builder",
+        help="Skip exporting the standalone GPU builder image.",
+    ),
 ) -> None:
     """Build FlowMesh Docker images locally using buildx."""
-    _run_bake("load", targets, env_file)
+    _run_bake("load", targets, env_file, no_builder=no_builder)
     logging.success("Images built locally.")
 
 
@@ -175,9 +267,14 @@ def push(
     env_file: Path = typer.Option(
         DEFAULT_ENV_FILE, "--env-file", help="Env file for stack compose/bake"
     ),
+    no_builder: bool = typer.Option(
+        False,
+        "--no-builder",
+        help="Skip publishing the standalone GPU builder image.",
+    ),
 ) -> None:
     """Build FlowMesh Docker images and push them to the container registry."""
-    _run_bake("push", targets, env_file)
+    _run_bake("push", targets, env_file, no_builder=no_builder)
     logging.success("Images pushed.")
 
 
@@ -302,9 +399,10 @@ def ps(
     """Display running status of stack containers and worker containers."""
     _compose(["ps"], env_file=env_file, env=None)
     logging.log("\nWorkers:")
+    docker_bin = _require_bin("docker")
     subprocess.run(
         [
-            "docker",
+            docker_bin,
             "ps",
             "-a",
             "--filter",
@@ -313,7 +411,7 @@ def ps(
             "  {{.Names}}\t{{.Status}}",
         ],
         check=False,
-    )
+    )  # nosec B603: argv list, absolute binary path.
 
 
 @app.command("status")

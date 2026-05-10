@@ -6,6 +6,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from server import env
+from server.supervisor.adapters.docker import (
+    DockerWorkerAdapter,
+    DockerWorkerConfig,
+    WorkerType,
+)
 from server.supervisor.manager import WorkerInitConfig, WorkerManager
 from server.supervisor.resource_manager import GpuArch, MachineEnv, ResourceManager
 
@@ -88,6 +94,101 @@ class TestAvailableGpuCount:
 
     def test_no_gpus(self) -> None:
         assert _resource_manager(set()).available_gpu_count == 0
+
+
+class TestMachineEnvDetection:
+    def test_gpu_probe_uses_configured_cuda_image(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rm = object.__new__(ResourceManager)
+        containers = MagicMock()
+        containers.run.return_value = b"0, NVIDIA H100\n"
+        rm._docker_client = MagicMock()
+        rm._docker_client.info.return_value = {"NCPU": 32}
+        rm._docker_client.containers = containers
+
+        monkeypatch.setattr(env, "SERVER_CUDA_PROBE_IMAGE", "example/probe:arm64")
+        monkeypatch.setattr(env, "CUDA_VISIBLE_DEVICES", None)
+
+        detected = rm._detect_machine_env()
+
+        assert detected.cpu_count == 32
+        assert detected.available_gpus == {0}
+        assert detected.gpu_families == {0: GpuArch.HOPPER}
+        containers.run.assert_called_once()
+        assert containers.run.call_args.kwargs["image"] == "example/probe:arm64"
+        assert "runtime" not in containers.run.call_args.kwargs
+
+    def test_gpu_probe_uses_runtime_override_when_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rm = object.__new__(ResourceManager)
+        containers = MagicMock()
+        containers.run.return_value = b"0, NVIDIA H100\n"
+        rm._docker_client = MagicMock()
+        rm._docker_client.info.return_value = {"NCPU": 32}
+        rm._docker_client.containers = containers
+
+        monkeypatch.setattr(env, "SERVER_CUDA_PROBE_IMAGE", "example/probe:legacy")
+        monkeypatch.setattr(env, "DOCKER_GPU_RUNTIME", "nvidia")
+        monkeypatch.setattr(env, "CUDA_VISIBLE_DEVICES", None)
+
+        detected = rm._detect_machine_env()
+
+        assert detected.available_gpus == {0}
+        assert containers.run.call_args.kwargs["runtime"] == "nvidia"
+
+
+class TestDockerWorkerRuntimeSelection:
+    def _worker(self) -> DockerWorkerAdapter:
+        worker = object.__new__(DockerWorkerAdapter)
+        worker.config = DockerWorkerConfig(worker_type=WorkerType.GPU, cuda_devices=[3])
+        worker.token = "worker-token"  # type: ignore[assignment]
+        worker.container_name = "worker-gpu-3"
+        worker.cuda_devices = [3]
+        worker.gpu_arch = GpuArch.BLACKWELL
+        return worker
+
+    def test_gpu_worker_omits_runtime_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker = self._worker()
+        monkeypatch.setattr(env, "DOCKER_GPU_RUNTIME", None)
+
+        environment: dict[str, str] = {}
+        labels: dict[str, str] = {}
+
+        device_requests, runtime = worker._apply_worker_type_settings(
+            environment, labels
+        )
+
+        assert runtime is None
+        assert device_requests is not None
+        assert environment["CUDA_VISIBLE_DEVICES"] == "0"
+        assert environment["WORKER_HOST_GPU_ID"] == "3"
+        assert environment["WORKER_HOST_GPU_ARCH"] == GpuArch.BLACKWELL.value
+        assert labels["flowmesh.worker.gpu_id"] == "3"
+
+    def test_gpu_worker_uses_runtime_override_when_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker = self._worker()
+        monkeypatch.setattr(env, "DOCKER_GPU_RUNTIME", "nvidia")
+
+        device_requests, runtime = worker._apply_worker_type_settings({}, {})
+
+        assert runtime == "nvidia"
+        assert device_requests is not None
+
+    def test_worker_environment_passes_runtime_override_to_worker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker = self._worker()
+        monkeypatch.setattr(env, "DOCKER_GPU_RUNTIME", "nvidia")
+
+        environment = worker._base_environment()
+
+        assert environment["DOCKER_GPU_RUNTIME"] == "nvidia"
 
 
 class TestCapacityChangeReporting:
