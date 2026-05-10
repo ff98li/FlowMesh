@@ -7,21 +7,47 @@ disconnected from a call site.
 """
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
-from fastapi import HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.testclient import TestClient
+from flowmesh_hook import (
+    BaseBindings,
+    FlowMeshUsageSink,
+    ResourceAction,
+    ResourceKind,
+    UsageRow,
+    WorkerView,
+)
+from lumid_hooks import PrincipalContext, ResourceRef
 
-from server.auth.security import PrincipalContext, authenticate_api_key
+from server.auth.security import (
+    authenticate_api_key,
+    authenticate_connection,
+    deregister_resource,
+    register_resource,
+    require_permission,
+    resolve_accessible_ids,
+)
 from server.hooks import (
     IDENTITY_PROVIDERS,
+    PERMISSION_CHECKERS,
+    RESOURCE_REGISTRARS,
     SUBMISSION_GUARDS,
+    SUPPLIER_RESOLVERS,
     USAGE_SINKS,
-    UsageRow,
-    UsageSink,
+    register,
 )
+from server.registries.worker import Worker
+from server.task.models import TaskRecord
+from server.task.runtime import TaskRuntime
+from shared.tasks import TaskEnvelopeTemplate
+from shared.tasks.worker_message import WorkerStatus
 
 
 @pytest.fixture
@@ -34,10 +60,16 @@ def _clear_registries() -> Iterator[None]:
     IDENTITY_PROVIDERS.clear()
     SUBMISSION_GUARDS.clear()
     USAGE_SINKS.clear()
+    PERMISSION_CHECKERS.clear()
+    SUPPLIER_RESOLVERS.clear()
+    RESOURCE_REGISTRARS.clear()
     yield
     IDENTITY_PROVIDERS.clear()
     SUBMISSION_GUARDS.clear()
     USAGE_SINKS.clear()
+    PERMISSION_CHECKERS.clear()
+    SUPPLIER_RESOLVERS.clear()
+    RESOURCE_REGISTRARS.clear()
 
 
 class _FakeIdentityProvider:
@@ -77,7 +109,7 @@ class TestIdentityProviderWiring:
         )
         first = _FakeIdentityProvider(returns=principal)
         second = _FakeIdentityProvider(returns=None)
-        IDENTITY_PROVIDERS.extend([first, second])
+        register(BaseBindings(identity_providers=[first, second]))
 
         result = await authenticate_api_key("opaque", logger)
 
@@ -90,7 +122,7 @@ class TestIdentityProviderWiring:
         self, logger: logging.Logger
     ) -> None:
         provider = _FakeIdentityProvider(returns=None)
-        IDENTITY_PROVIDERS.append(provider)
+        register(BaseBindings(identity_providers=[provider]))
 
         with pytest.raises(HTTPException) as exc_info:
             await authenticate_api_key("opaque", logger)
@@ -131,7 +163,7 @@ class TestSubmissionGuardWiring:
                     status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="nope"
                 )
 
-        SUBMISSION_GUARDS.extend([_AllowGuard(), _BlockGuard()])
+        register(BaseBindings(submission_guards=[_AllowGuard(), _BlockGuard()]))
         principal = PrincipalContext(
             principal_id="p",
             org_id="x",
@@ -164,17 +196,21 @@ class TestUsageSinkWiring:
         class _BoomSink:
             name = "boom"
 
-            async def emit(self, rows: list[UsageRow], logger: logging.Logger) -> None:
+            async def emit(
+                self, rows: Sequence[UsageRow], logger: logging.Logger
+            ) -> None:
                 seen.append("boom")
                 raise RuntimeError("kaboom")
 
         class _OkSink:
             name = "ok"
 
-            async def emit(self, rows: list[UsageRow], logger: logging.Logger) -> None:
+            async def emit(
+                self, rows: Sequence[UsageRow], logger: logging.Logger
+            ) -> None:
                 seen.append("ok")
 
-        sinks: list[UsageSink] = [_BoomSink(), _OkSink()]
+        sinks: list[FlowMeshUsageSink] = [_BoomSink(), _OkSink()]
         rows: list[UsageRow] = [
             UsageRow(
                 org_id="x",
@@ -197,3 +233,463 @@ class TestUsageSinkWiring:
                 logger.warning("Usage sink %s failed: %s", sink.name, exc)
 
         assert seen == ["boom", "ok"]  # second sink ran despite first failure
+
+
+class _CapturingProvider:
+    name = "capturing"
+
+    def __init__(self, returns: PrincipalContext | None) -> None:
+        self.returns = returns
+        self.tokens_seen: list[str] = []
+
+    async def resolve(
+        self, raw_token: str, logger: logging.Logger
+    ) -> PrincipalContext | None:
+        self.tokens_seen.append(raw_token)
+        return self.returns
+
+
+def _build_submit_app() -> FastAPI:
+    """A FastAPI app that exercises only the `authenticate_connection` dep.
+
+    The real submit endpoint pulls in registries and Redis; this stub
+    keeps the test focused on whether the dependency extracts the bearer
+    token and routes it through `IDENTITY_PROVIDERS`.
+    """
+    app = FastAPI()
+    app.state.logger = logging.getLogger("test.authenticate_connection")
+
+    @app.post("/probe")
+    async def probe(
+        principal: PrincipalContext = Depends(authenticate_connection),
+    ) -> dict[str, str]:
+        return {
+            "principal_id": principal.principal_id,
+            "org_id": principal.org_id,
+        }
+
+    return app
+
+
+class TestAuthenticateConnection:
+    """The router-level FastAPI dependency must run the auth chain on every call.
+
+    Before this dependency landed, `submit_workflow` called
+    `default_principal()` directly and never read the `Authorization`
+    header — registered `IdentityProvider`s saw zero traffic.
+    """
+
+    def test_no_providers_yields_admin_default(self) -> None:
+        app = _build_submit_app()
+        client = TestClient(app)
+
+        response = client.post("/probe", headers={"Authorization": "Bearer abc"})
+
+        assert response.status_code == 200
+        assert response.json() == {"principal_id": "admin", "org_id": "local"}
+
+    def test_provider_receives_bearer_token(self) -> None:
+        principal = PrincipalContext(
+            principal_id="p-1",
+            org_id="org-1",
+            external_id="ext-1",
+            principal_type="user",
+            scopes=[],
+        )
+        provider = _CapturingProvider(returns=principal)
+        register(BaseBindings(identity_providers=[provider]))
+
+        app = _build_submit_app()
+        client = TestClient(app)
+
+        response = client.post("/probe", headers={"Authorization": "Bearer secret-x"})
+
+        assert response.status_code == 200
+        assert response.json() == {"principal_id": "p-1", "org_id": "org-1"}
+        assert provider.tokens_seen == ["secret-x"]
+
+    def test_missing_authorization_header_falls_through_to_401(self) -> None:
+        provider = _CapturingProvider(returns=None)
+        register(BaseBindings(identity_providers=[provider]))
+
+        app = _build_submit_app()
+        client = TestClient(app)
+
+        response = client.post("/probe")
+
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert provider.tokens_seen == [""]
+
+
+class TestPermissionCheckerComposition:
+    @pytest.fixture
+    def principal(self) -> PrincipalContext:
+        return PrincipalContext(
+            principal_id="p",
+            org_id="o",
+            external_id="e",
+            principal_type="user",
+            scopes=[],
+        )
+
+    @pytest.mark.anyio
+    async def test_no_checkers_means_no_filter(
+        self, principal: PrincipalContext, logger: logging.Logger
+    ) -> None:
+        ids = await resolve_accessible_ids(
+            principal, ResourceKind.TASK, ResourceAction.READ, logger
+        )
+        assert ids is None
+
+    @pytest.mark.anyio
+    async def test_none_checker_imposes_no_filter(
+        self, principal: PrincipalContext, logger: logging.Logger
+    ) -> None:
+        class _BoundChecker:
+            name = "bound"
+
+            async def accessible_ids(
+                self,
+                principal: PrincipalContext,
+                kind: str,
+                action: str,
+                logger: logging.Logger,
+            ) -> frozenset[str] | None:
+                return frozenset({"tsk-A"})
+
+            async def require(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
+        class _NoFilterChecker:
+            name = "nofilter"
+
+            async def accessible_ids(
+                self,
+                principal: PrincipalContext,
+                kind: str,
+                action: str,
+                logger: logging.Logger,
+            ) -> frozenset[str] | None:
+                return None
+
+            async def require(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
+        register(
+            BaseBindings(permission_checkers=[_BoundChecker(), _NoFilterChecker()])
+        )
+
+        ids = await resolve_accessible_ids(
+            principal, ResourceKind.TASK, ResourceAction.READ, logger
+        )
+        assert ids == frozenset({"tsk-A"})
+
+    @pytest.mark.anyio
+    async def test_all_none_results_yields_no_filter(
+        self, principal: PrincipalContext, logger: logging.Logger
+    ) -> None:
+        class _NoFilter:
+            name = "nofilter"
+
+            async def accessible_ids(
+                self, *args: Any, **kwargs: Any
+            ) -> frozenset[str] | None:
+                return None
+
+            async def require(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
+        register(BaseBindings(permission_checkers=[_NoFilter(), _NoFilter()]))
+
+        ids = await resolve_accessible_ids(
+            principal, ResourceKind.TASK, ResourceAction.READ, logger
+        )
+        assert ids is None
+
+    @pytest.mark.anyio
+    async def test_set_results_are_intersected(
+        self, principal: PrincipalContext, logger: logging.Logger
+    ) -> None:
+        class _A:
+            name = "a"
+
+            async def accessible_ids(
+                self,
+                principal: PrincipalContext,
+                kind: str,
+                action: str,
+                logger: logging.Logger,
+            ) -> frozenset[str] | None:
+                return frozenset({"tsk-1", "tsk-2"})
+
+            async def require(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
+        class _B:
+            name = "b"
+
+            async def accessible_ids(
+                self,
+                principal: PrincipalContext,
+                kind: str,
+                action: str,
+                logger: logging.Logger,
+            ) -> frozenset[str] | None:
+                return frozenset({"tsk-2", "tsk-3"})
+
+            async def require(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
+        register(BaseBindings(permission_checkers=[_A(), _B()]))
+
+        ids = await resolve_accessible_ids(
+            principal, ResourceKind.TASK, ResourceAction.READ, logger
+        )
+        assert ids == frozenset({"tsk-2"})
+
+    @pytest.mark.anyio
+    async def test_disjoint_set_results_yield_empty(
+        self, principal: PrincipalContext, logger: logging.Logger
+    ) -> None:
+        class _A:
+            name = "a"
+
+            async def accessible_ids(
+                self, *args: Any, **kwargs: Any
+            ) -> frozenset[str] | None:
+                return frozenset({"tsk-1"})
+
+            async def require(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
+        class _B:
+            name = "b"
+
+            async def accessible_ids(
+                self, *args: Any, **kwargs: Any
+            ) -> frozenset[str] | None:
+                return frozenset({"tsk-2"})
+
+            async def require(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
+        register(BaseBindings(permission_checkers=[_A(), _B()]))
+
+        ids = await resolve_accessible_ids(
+            principal, ResourceKind.TASK, ResourceAction.READ, logger
+        )
+        assert ids == frozenset()
+
+    @pytest.mark.anyio
+    async def test_require_passes_when_no_checkers(
+        self, principal: PrincipalContext, logger: logging.Logger
+    ) -> None:
+        await require_permission(
+            principal, ResourceKind.TASK, "tsk-1", ResourceAction.READ, logger
+        )
+
+    @pytest.mark.anyio
+    async def test_require_first_failure_short_circuits(
+        self, principal: PrincipalContext, logger: logging.Logger
+    ) -> None:
+        seen: list[str] = []
+
+        class _Block:
+            name = "block"
+
+            async def accessible_ids(
+                self, *args: Any, **kwargs: Any
+            ) -> frozenset[str] | None:
+                return None
+
+            async def require(self, *args: Any, **kwargs: Any) -> None:
+                seen.append("block")
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="nope"
+                )
+
+        class _NeverRuns:
+            name = "never"
+
+            async def accessible_ids(
+                self, *args: Any, **kwargs: Any
+            ) -> frozenset[str] | None:
+                return None
+
+            async def require(self, *args: Any, **kwargs: Any) -> None:
+                seen.append("never")
+
+        register(BaseBindings(permission_checkers=[_Block(), _NeverRuns()]))
+
+        with pytest.raises(HTTPException) as exc_info:
+            await require_permission(
+                principal, ResourceKind.TASK, "tsk-1", ResourceAction.READ, logger
+            )
+
+        assert exc_info.value.status_code == status.HTTP_403_FORBIDDEN
+        assert seen == ["block"]
+
+
+def _make_runtime_with_record(task_id: str) -> tuple[TaskRuntime, TaskRecord]:
+    runtime = TaskRuntime(
+        workflow_registry=MagicMock(),
+        worker_registry=MagicMock(),
+        logger=logging.getLogger("test.supplier"),
+    )
+    env = TaskEnvelopeTemplate.model_validate(
+        {"apiVersion": "mloc/v1", "kind": "Task", "spec": {"taskType": "echo"}}
+    )
+    record = TaskRecord(
+        task_id=task_id,
+        workflow_id="wfl-1",
+        owner_id="admin",
+        raw_yaml="",
+        task=env,
+    )
+    runtime._tasks[task_id] = record  # type: ignore[attr-defined]
+    return runtime, record
+
+
+def _make_worker() -> Worker:
+    return Worker(
+        id="wkr-1",
+        namespace="ns",
+        cluster="cl",
+        node_id="nd-1",
+        node_alias="nd-1",
+        status=WorkerStatus.IDLE,
+    )
+
+
+class TestSupplierResolverWiring:
+    def test_first_non_none_wins_and_stamps_record(self) -> None:
+        class _ReturnsNone:
+            name = "none"
+
+            def resolve(self, worker: WorkerView) -> str | None:
+                return None
+
+        class _ReturnsValue:
+            name = "value"
+
+            def resolve(self, worker: WorkerView) -> str | None:
+                return "sup-cloud-1"
+
+        class _NeverRuns:
+            name = "never"
+
+            def resolve(self, worker: WorkerView) -> str | None:
+                raise AssertionError("subsequent resolvers must not run")
+
+        register(
+            BaseBindings(
+                supplier_resolvers=[_ReturnsNone(), _ReturnsValue(), _NeverRuns()]
+            )
+        )
+
+        runtime, record = _make_runtime_with_record("tsk-1")
+        runtime.mark_dispatched("tsk-1", _make_worker())
+
+        assert record.supplier_id == "sup-cloud-1"
+
+    def test_no_resolvers_leaves_supplier_id_empty(self) -> None:
+        runtime, record = _make_runtime_with_record("tsk-2")
+        runtime.mark_dispatched("tsk-2", _make_worker())
+
+        assert record.supplier_id == ""
+
+
+class _RecordingRegistrar:
+    name = "recording"
+
+    def __init__(self) -> None:
+        self.registered: list[tuple[str, ResourceRef]] = []
+        self.deregistered: list[tuple[str, ResourceRef]] = []
+
+    async def register(
+        self,
+        principal: PrincipalContext,
+        resource: ResourceRef,
+        logger: logging.Logger,
+    ) -> None:
+        self.registered.append((principal.principal_id, resource))
+
+    async def deregister(
+        self,
+        principal: PrincipalContext,
+        resource: ResourceRef,
+        logger: logging.Logger,
+    ) -> None:
+        self.deregistered.append((principal.principal_id, resource))
+
+
+class TestResourceRegistrarComposition:
+    @pytest.fixture
+    def principal(self) -> PrincipalContext:
+        return PrincipalContext(
+            principal_id="p-1",
+            org_id="org-1",
+            external_id="ext-1",
+            principal_type="user",
+            scopes=["user"],
+        )
+
+    @pytest.mark.anyio
+    async def test_no_registrars_is_noop(
+        self, principal: PrincipalContext, logger: logging.Logger
+    ) -> None:
+        await register_resource(
+            principal, ResourceKind.WORKFLOW, "wfl-1", {"name": "n"}, logger
+        )
+        await deregister_resource(principal, ResourceKind.WORKFLOW, "wfl-1", logger)
+
+    @pytest.mark.anyio
+    async def test_register_fans_out_in_registration_order(
+        self, principal: PrincipalContext, logger: logging.Logger
+    ) -> None:
+        first = _RecordingRegistrar()
+        second = _RecordingRegistrar()
+        register(BaseBindings(resource_registrars=[first, second]))
+
+        await register_resource(
+            principal, ResourceKind.WORKFLOW, "wfl-1", {"name": "n"}, logger
+        )
+
+        expected = ResourceRef(
+            kind=ResourceKind.WORKFLOW.value, id="wfl-1", metadata={"name": "n"}
+        )
+        for r in (first, second):
+            assert r.registered == [("p-1", expected)]
+
+    @pytest.mark.anyio
+    async def test_deregister_fans_out(
+        self, principal: PrincipalContext, logger: logging.Logger
+    ) -> None:
+        recorder = _RecordingRegistrar()
+        register(BaseBindings(resource_registrars=[recorder]))
+
+        await deregister_resource(principal, ResourceKind.WORKER, "wkr-1", logger)
+
+        assert recorder.deregistered == [
+            ("p-1", ResourceRef(kind=ResourceKind.WORKER.value, id="wkr-1"))
+        ]
+
+    @pytest.mark.anyio
+    async def test_register_propagates_failure(
+        self, principal: PrincipalContext, logger: logging.Logger
+    ) -> None:
+        class _Boom:
+            name = "boom"
+
+            async def register(self, *args: Any, **kwargs: Any) -> None:
+                raise RuntimeError("plugin failure")
+
+            async def deregister(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
+        register(BaseBindings(resource_registrars=[_Boom()]))
+
+        with pytest.raises(RuntimeError, match="plugin failure"):
+            await register_resource(
+                principal, ResourceKind.WORKFLOW, "wfl-1", {}, logger
+            )

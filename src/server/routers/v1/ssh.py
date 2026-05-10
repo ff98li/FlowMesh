@@ -24,7 +24,14 @@ from ...app_state import (
     get_ssh_proxy_enabled,
     get_worker_registry,
 )
+from ...auth.security import (
+    PrincipalContext,
+    authenticate_connection,
+    authenticate_websocket,
+    require_permission,
+)
 from ...clients.redis import RedisClient, ssh_down_key, ssh_up_key
+from ...hooks import ResourceAction, ResourceKind
 from ...registries.node import NodeRegistry
 from ...registries.worker import Worker, WorkerRegistry
 from ...schemas.ssh import SSHConnectionInfo
@@ -79,6 +86,7 @@ async def _start_server_uplink(
 async def ssh_proxy(
     websocket: WebSocket,
     task_id: str = ApiPath(..., min_length=1),
+    principal: PrincipalContext = Depends(authenticate_websocket),
     runtime: TaskRuntime = Depends(get_runtime),
     redis_client: RedisClient = Depends(get_redis_client),
     logger: logging.Logger = Depends(get_logger),
@@ -94,11 +102,23 @@ async def ssh_proxy(
     connection, then relays SSH bytes between the client WebSocket and Redis
     Streams.
 
+    Authentication: bearer token from the ``Authorization`` header, or
+    ``?token=...`` query param for browser clients that can't set headers.
+
     Close behavior:
-    - ``4403``: proxy access disabled
+    - ``4401``: missing or invalid bearer token
+    - ``4403``: proxy access disabled, or principal not authorized for the task
     - ``4404``: task not found
     - ``1011``: relay/uplink unavailable
     """
+    try:
+        await require_permission(
+            principal, ResourceKind.TASK, task_id, ResourceAction.READ, logger
+        )
+    except Exception:
+        await websocket.close(code=4403, reason="forbidden")
+        return
+
     if not proxy_enabled:
         await websocket.close(code=4403, reason="proxy disabled")
         return
@@ -232,8 +252,13 @@ async def ssh_proxy(
 )
 async def list_ssh_connections(
     request: Request,
+    principal: PrincipalContext = Depends(authenticate_connection),
     ssh_audit: SshAuditService | None = Depends(get_ssh_audit),
+    logger: logging.Logger = Depends(get_logger),
 ) -> list[SSHConnectionInfo]:
+    await require_permission(
+        principal, ResourceKind.SYSTEM, None, ResourceAction.ADMIN, logger
+    )
     if ssh_audit is None:
         return []
     connections = await ssh_audit.list_connections()

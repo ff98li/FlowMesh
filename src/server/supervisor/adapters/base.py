@@ -1,10 +1,12 @@
 import os
 from abc import ABC, abstractmethod
-from typing import NewType, Self
+from dataclasses import dataclass
+from typing import NewType
 
 from pydantic import BaseModel, ConfigDict, SecretStr
 
 from ... import env
+from ...hooks import PrincipalContext
 from ..schemas import WorkerInfo, WorkerStatus
 from .utils import env_to_secret_str, to_env_str
 
@@ -77,11 +79,18 @@ WorkerTokenType = NewType("WorkerTokenType", str)
 
 
 class WorkerAdapter(ABC):
-    def __init__(self, token: WorkerTokenType, name: str, config: WorkerConfig) -> None:
+    def __init__(
+        self,
+        token: WorkerTokenType,
+        name: str,
+        config: WorkerConfig,
+        owner: PrincipalContext,
+    ) -> None:
         self._worker_id: str | None = None
         self.token = token
         self.name = name
         self.config = config
+        self.owner = owner
 
     @property
     @abstractmethod
@@ -155,6 +164,7 @@ class WorkerAdapter(ABC):
             "WORKER_UPLOAD_RESULTS": to_env_str(config.upload_results),
             "DOCKER_GPU_RUNTIME": to_env_str(env.DOCKER_GPU_RUNTIME),
             "FLOWMESH_API_KEY": to_env_str(env.FLOWMESH_API_KEY),
+            "WORKER_OWNER_PRINCIPAL_JSON": self.owner.model_dump_json(),
             "OPENAI_API_KEY": to_env_str(config.openai_api_key),
             "GOOGLE_API_KEY": to_env_str(config.google_api_key),
             "HF_TOKEN": to_env_str(config.hf_token),
@@ -172,13 +182,8 @@ class WorkerAdapter(ABC):
 
 
 class WorkerFactory(ABC):
-    _instance: Self | None = None
-
-    @classmethod
-    def get_instance(cls) -> Self:
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
+    def __init__(self, system_principal: PrincipalContext) -> None:
+        self.system_principal = system_principal
 
     @abstractmethod
     def create_worker(self, token: WorkerTokenType, *args, **kwargs) -> WorkerAdapter:
@@ -190,3 +195,17 @@ class WorkerFactory(ABC):
 
     def cleanup(self) -> None:
         pass
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    """Per-provider dispatch entry consumed by `WorkerManager`.
+
+    Each provider module (e.g. `adapters.docker`, `adapters.vastai`) exposes a
+    `get_provider_spec(system_principal)` builder that returns one of these.
+    """
+
+    name: str
+    config_cls: type[WorkerConfig]
+    adapter_cls: type[WorkerAdapter]
+    factory: WorkerFactory

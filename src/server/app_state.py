@@ -1,17 +1,18 @@
 import logging
 from pathlib import Path
-from typing import Any
 
 from starlette.requests import HTTPConnection
 
 from .clients import RedisClient
 from .dispatcher import Dispatcher
+from .hooks import PrincipalContext
 from .registries import NodeRegistry, WorkerRegistry, WorkflowRegistry
 from .services.metrics import MetricsRecorder
 from .services.monitoring import EventMonitor
 from .services.ssh_audit import SshAuditService
 from .services.ssh_forward import SshForwardService
 from .services.watchdog import WorkerWatchdog
+from .supervisor.supervisor import WorkerSupervisor
 from .task.runtime import TaskRuntime
 
 
@@ -59,8 +60,24 @@ def get_redis_client(conn: HTTPConnection) -> RedisClient:
     return conn.app.state.redis_client
 
 
-def get_supervisor(conn: HTTPConnection) -> Any:
-    return conn.app.state.supervisor
+def get_supervisor(conn: HTTPConnection) -> WorkerSupervisor:
+    supervisor = conn.app.state.supervisor
+    if supervisor is None:
+        raise RuntimeError("Supervisor not initialized; worker management unavailable")
+    return supervisor
+
+
+def get_node_id(conn: HTTPConnection) -> str:
+    node_id = conn.app.state.node_id
+    if not isinstance(node_id, str) or not node_id:
+        raise RuntimeError("node_id not assigned; supervisor not started")
+    return node_id
+
+
+def get_system_principal(conn: HTTPConnection) -> PrincipalContext:
+    if conn.app.state.system_principal is None:
+        raise RuntimeError("System principal not initialized")
+    return conn.app.state.system_principal
 
 
 def get_ssh_forward(conn: HTTPConnection) -> SshForwardService | None:

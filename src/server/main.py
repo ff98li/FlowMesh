@@ -8,6 +8,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
+from lumid_hooks import HookBindings
 
 if __name__ == "__main__" and __package__ is None:
     import sys
@@ -16,9 +17,11 @@ if __name__ == "__main__" and __package__ is None:
     __package__ = "server"
     sys.modules.setdefault("server.main", sys.modules[__name__])
 
+from .auth import resolve_system_principal
 from .clients import RedisClient
 from .config import NodeRole, ServerConfig
 from .dispatcher.factory import create_dispatcher
+from .hooks import register
 from .registries import WorkerRegistry, WorkflowRegistry
 from .registries.node import NodeRegistry
 from .routers import docs, health, v1
@@ -152,7 +155,6 @@ if IS_ROOT_NODE:
 
     EVENT_MONITOR = EventMonitor(
         redis_client=REDIS_CLIENT.sync,
-        stop_event=threading.Event(),  # replaced below
         logger=logger,
         runtime=RUNTIME,
         dispatcher=DISPATCHER,
@@ -210,12 +212,8 @@ BACKGROUND_THREADS: list[threading.Thread] = []
 def _start_root_threads() -> None:
     """Start orchestrator background threads. Only called on root nodes."""
     assert DISPATCHER is not None
-    assert EVENT_MONITOR is not None
     assert LOG_ARCHIVER is not None
     assert WATCHDOG is not None
-
-    # Replace the placeholder stop_event on the EventMonitor
-    EVENT_MONITOR._stop_event = STOP_EVENT
 
     dispatcher = DISPATCHER
     dispatch_thread = threading.Thread(
@@ -225,9 +223,6 @@ def _start_root_threads() -> None:
     )
     dispatch_thread.start()
     BACKGROUND_THREADS.append(dispatch_thread)
-
-    for thread in EVENT_MONITOR.start():
-        BACKGROUND_THREADS.append(thread)
 
     log_archiver_thread = threading.Thread(
         target=LOG_ARCHIVER.run, args=(STOP_EVENT,), name="log-archiver", daemon=True
@@ -282,25 +277,30 @@ app = FastAPI(
 
 
 async def _load_plugins(stack: AsyncExitStack) -> None:
-    """Load FLOWMESH_PLUGINS modules and enter any async-context-manager install()
-    helpers into the lifespan's exit stack.
+    """Load FLOWMESH_PLUGINS modules and drain their `HookBindings` into the
+    server's runtime registries.
 
     A plugin's `install()` is either:
-      - a sync function returning None (fire-and-forget registration), or
-      - an `@asynccontextmanager async def` returning a ctx manager (registers
-        on enter, cleans up on exit; e.g. closes a SQLAlchemy engine).
+      - a sync function returning a `HookBindings`, or
+      - an `@asynccontextmanager async def` yielding a `HookBindings` (the
+        ctx manager registers on enter, cleans up on exit; e.g. closes a
+        SQLAlchemy engine).
     """
-    raw = os.getenv("FLOWMESH_PLUGINS", "")
-    for entry in raw.split(","):
-        plugin_name = entry.strip()
-        if not plugin_name:
-            continue
+    for plugin_name in config.plugins:
         mod = importlib.import_module(plugin_name)
         rv = mod.install()
         if hasattr(rv, "__aenter__"):
-            await stack.enter_async_context(rv)
+            bindings = await stack.enter_async_context(rv)
         elif inspect.iscoroutine(rv):
-            await rv
+            bindings = await rv
+        else:
+            bindings = rv
+        if not isinstance(bindings, HookBindings):
+            raise TypeError(
+                f"{plugin_name}.install() must return HookBindings, got "
+                f"{type(bindings).__name__}"
+            )
+        register(bindings)
 
 
 @asynccontextmanager
@@ -308,15 +308,28 @@ async def _lifespan(_: FastAPI):
     async with AsyncExitStack() as plugin_stack:
         await _load_plugins(plugin_stack)
 
+        # --- System principal resolution ---
+        system_principal = await resolve_system_principal(
+            config.identity.api_key, logger
+        )
+        app.state.system_principal = system_principal
+
         # --- Root-only startup ---
         if IS_ROOT_NODE:
             if SSH_FORWARD_SERVICE is not None:
                 await SSH_FORWARD_SERVICE.start()
             _start_root_threads()
+            if EVENT_MONITOR is not None:
+                EVENT_MONITOR.start()
 
         # --- Supervisor (all nodes with worker management) ---
         if SUPERVISOR is not None:
-            await SUPERVISOR.start()
+            await SUPERVISOR.start(system_principal)
+            app.state.node_id = SUPERVISOR.node_id
+            # Tell EventMonitor which node this server belongs to so that it can wait
+            # for the supervisor's SV_UNREGISTER event on shutdown.
+            if EVENT_MONITOR is not None:
+                EVENT_MONITOR.set_own_node(SUPERVISOR.node_id)
 
         try:
             yield
@@ -324,6 +337,11 @@ async def _lifespan(_: FastAPI):
             # --- Supervisor shutdown ---
             if SUPERVISOR is not None:
                 await SUPERVISOR.stop()
+                app.state.node_id = None
+
+            # --- Event monitor shutdown ---
+            if EVENT_MONITOR is not None:
+                await EVENT_MONITOR.stop()
 
             # --- Root-only shutdown ---
             _stop_background()
@@ -345,6 +363,9 @@ app.state.metrics_recorder = METRICS_RECORDER
 app.state.redis_client = REDIS_CLIENT
 app.state.results_dir = RESULTS_DIR
 app.state.supervisor = SUPERVISOR
+# resolved during lifespan startup
+app.state.node_id = None
+app.state.system_principal = None
 
 # Root-only state (None on worker nodes)
 app.state.runtime = RUNTIME

@@ -23,13 +23,19 @@ from ...app_state import (
     get_runtime,
     get_workflow_registry,
 )
-from ...auth.security import default_principal
+from ...auth.security import (
+    PrincipalContext,
+    authenticate_connection,
+    register_resource,
+    require_permission,
+    resolve_accessible_ids,
+)
 from ...clients.redis import (
     RedisClient,
     workflow_log_closed_key,
     workflow_log_stream_key,
 )
-from ...hooks import SUBMISSION_GUARDS
+from ...hooks import SUBMISSION_GUARDS, ResourceAction, ResourceKind
 from ...registries.workflow import Workflow, WorkflowRegistry
 from ...schemas.logs import LogEntry, LogEvent, LogQueryResponse
 from ...schemas.workflow import (
@@ -113,6 +119,7 @@ async def submit_workflow(
     workflow_format: str = Header(
         default="native", description="Workflow format (native/n8n)"
     ),
+    principal: PrincipalContext = Depends(authenticate_connection),
     runtime: TaskRuntime = Depends(get_runtime),
     metrics: MetricsRecorder = Depends(get_metrics),
     logger: logging.Logger = Depends(get_logger),
@@ -124,9 +131,9 @@ async def submit_workflow(
             detail="Request body is required",
         )
 
-    # OSS: no auth → synthetic admin principal. Plugins can still gate via
-    # SUBMISSION_GUARDS even though OSS doesn't authenticate the caller.
-    principal = default_principal()
+    await require_permission(
+        principal, ResourceKind.WORKFLOW, None, ResourceAction.WRITE, logger
+    )
     for guard in SUBMISSION_GUARDS:
         await guard.check(principal, logger)
 
@@ -144,6 +151,22 @@ async def submit_workflow(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to register workflow: {exc}",
         ) from exc
+
+    await register_resource(
+        principal,
+        ResourceKind.WORKFLOW,
+        workflow_id,
+        {"format": workflow_format, "task_count": len(entries)},
+        logger,
+    )
+    for entry in entries:
+        await register_resource(
+            principal,
+            ResourceKind.TASK,
+            entry.task_id,
+            {"workflow_id": workflow_id},
+            logger,
+        )
 
     results: list[WorkflowSubmitTaskEntry] = []
 
@@ -198,6 +221,7 @@ async def validate_workflow(
     workflow_format: str = Header(
         default="native", description="Workflow format (native/n8n)"
     ),
+    _: PrincipalContext = Depends(authenticate_connection),
     runtime: TaskRuntime = Depends(get_runtime),
 ) -> WorkflowValidateResponse:
     raw_body = await request.body()
@@ -247,8 +271,13 @@ async def validate_workflow(
 )
 async def get_workflow(
     workflow_id: str,
+    principal: PrincipalContext = Depends(authenticate_connection),
     registry: WorkflowRegistry = Depends(get_workflow_registry),
+    logger: logging.Logger = Depends(get_logger),
 ) -> Workflow:
+    await require_permission(
+        principal, ResourceKind.WORKFLOW, workflow_id, ResourceAction.READ, logger
+    )
     workflow = await registry.get_workflow_async(workflow_id)
     if not workflow:
         raise HTTPException(
@@ -289,8 +318,13 @@ async def get_workflow_logs(
             '(example: `"1707349300000-0"`).'
         ),
     ),
+    principal: PrincipalContext = Depends(authenticate_connection),
     redis: RedisClient = Depends(get_redis_client),
+    logger: logging.Logger = Depends(get_logger),
 ) -> LogQueryResponse:
+    await require_permission(
+        principal, ResourceKind.WORKFLOW, workflow_id, ResourceAction.READ, logger
+    )
     limit = max(1, min(10_000, int(limit)))
     if before and after:
         raise HTTPException(
@@ -378,8 +412,13 @@ async def stream_workflow_logs(
             "takes precedence."
         ),
     ),
+    principal: PrincipalContext = Depends(authenticate_connection),
     redis: RedisClient = Depends(get_redis_client),
+    logger: logging.Logger = Depends(get_logger),
 ):
+    await require_permission(
+        principal, ResourceKind.WORKFLOW, workflow_id, ResourceAction.READ, logger
+    )
     key = workflow_log_stream_key(workflow_id)
     if not await redis.asyncio.exists_telemetry(key):
         raise HTTPException(
@@ -454,9 +493,14 @@ async def stream_workflow_logs(
 )
 async def cancel_workflow(
     workflow_id: str,
+    principal: PrincipalContext = Depends(authenticate_connection),
     runtime: TaskRuntime = Depends(get_runtime),
     registry: WorkflowRegistry = Depends(get_workflow_registry),
+    logger: logging.Logger = Depends(get_logger),
 ) -> Workflow:
+    await require_permission(
+        principal, ResourceKind.WORKFLOW, workflow_id, ResourceAction.CANCEL, logger
+    )
     runtime.cancel_workflow(workflow_id)
     workflow = await registry.get_workflow_async(workflow_id)
     if not workflow:
@@ -475,9 +519,16 @@ async def cancel_workflow(
 )
 async def list_workflows(
     request: Request,
+    principal: PrincipalContext = Depends(authenticate_connection),
     registry: WorkflowRegistry = Depends(get_workflow_registry),
+    logger: logging.Logger = Depends(get_logger),
 ) -> list[Workflow]:
     workflow_ids = await registry.get_workflow_ids_async()
+    allowed = await resolve_accessible_ids(
+        principal, ResourceKind.WORKFLOW, ResourceAction.READ, logger
+    )
+    if allowed is not None:
+        workflow_ids = workflow_ids & allowed
     workflows: list[Workflow] = []
     for workflow_id in workflow_ids:
         workflow = await registry.get_workflow_async(workflow_id)

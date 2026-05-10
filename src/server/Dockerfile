@@ -36,9 +36,11 @@ RUN uv pip install --python /opt/py312/bin/python --system -r src/server/require
 
 COPY src/server ./src/server
 COPY src/shared ./src/shared
+COPY hook/src ./hook/src
 
-# Ensure packages are importable
-ENV PYTHONPATH=/app/src
+# Ensure packages and plugins, if any, are importable.
+ENV PYTHONPATH=/app/src:/app/hook/src:/app/plugins
+RUN mkdir -p /app/plugins
 
 # Default server env
 ENV REDIS_URL=redis://redis_control:6379/0 \

@@ -2,7 +2,6 @@ import base64
 import binascii
 import json
 import logging
-import os
 import queue
 import threading
 import time
@@ -38,6 +37,7 @@ class SupervisorClient:
     def __init__(
         self,
         worker_token: str,
+        owner_principal: dict[str, Any] | None,
         grpc_target: str,
         worker_namespace: str,
         worker_cluster: str,
@@ -47,6 +47,7 @@ class SupervisorClient:
         grpc_keepalive_time_ms: int | None = None,
         grpc_keepalive_timeout_ms: int | None = None,
     ):
+        self.owner_principal = owner_principal
         self.grpc_target = grpc_target
         self.worker_namespace = worker_namespace
         self.worker_cluster = worker_cluster
@@ -134,6 +135,7 @@ class SupervisorClient:
             ts=started_at,
             tags=tags,
             payload=payload,
+            actor=self.owner_principal,
         )
 
     def start(self) -> None:
@@ -237,6 +239,7 @@ class SupervisorClient:
             type="UNREGISTER",
             worker_id=self.worker_id,
             payload=payload,
+            actor=self.owner_principal,
         )
         self._send_event(event)
 
@@ -389,8 +392,6 @@ class SupervisorClient:
         if not resp.worker_id:
             raise SystemExit("Supervisor registration response missing worker_id")
         self._worker_id = resp.worker_id
-        if resp.api_key:
-            os.environ["FLOWMESH_API_KEY"] = resp.api_key
 
     def _start_event_stream(self) -> None:
         self._event_ready.clear()

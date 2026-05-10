@@ -1,14 +1,24 @@
 """Local stack worker management"""
 
 import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from shared.schemas.command import CommandMessage, CommandType
 
-from ...app_state import get_supervisor
-from ...supervisor.supervisor import WorkerSupervisor
+from ...app_state import get_logger, get_node_id, get_supervisor
+from ...auth.security import (
+    PrincipalContext,
+    authenticate_connection,
+    require_permission,
+)
+from ...hooks import ResourceAction, ResourceKind
+from ...supervisor import WorkerSupervisor
+from ...supervisor.manager import WorkerInitConfig
+from ...supervisor.schemas import WorkerInfo
+from ...utils.misc import filter_models_by_queries
 
 router = APIRouter(prefix="/stack/workers", tags=["Stack"])
 
@@ -38,32 +48,54 @@ async def _exec(
 
 @router.get("")
 async def list_workers(
+    request: Request,
+    principal: PrincipalContext = Depends(authenticate_connection),
     supervisor: WorkerSupervisor = Depends(get_supervisor),
-) -> list[dict[str, Any]]:
+    node_id: str = Depends(get_node_id),
+    logger: logging.Logger = Depends(get_logger),
+) -> list[WorkerInfo]:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.READ, logger
+    )
     cmd = CommandMessage(command=CommandType.GET_WORKERS)
     data = await _exec(supervisor, cmd)
-    return data.get("workers", [])
+    workers = [WorkerInfo(**w) for w in data.get("workers", [])]
+    return filter_models_by_queries(workers, request.query_params)
 
 
 @router.post("")
 async def create_worker(
-    request: Request, supervisor: WorkerSupervisor = Depends(get_supervisor)
-) -> dict[str, Any]:
-    body = await request.json()
-    cmd = CommandMessage(command=CommandType.CREATE_WORKER, payload=body)
-    return await _exec(supervisor, cmd, timeout=_WORKER_CREATE_TIMEOUT)
+    init_config: WorkerInitConfig,
+    principal: PrincipalContext = Depends(authenticate_connection),
+    supervisor: WorkerSupervisor = Depends(get_supervisor),
+    node_id: str = Depends(get_node_id),
+    logger: logging.Logger = Depends(get_logger),
+) -> WorkerInfo:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.WRITE, logger
+    )
+    cmd = CommandMessage(
+        command=CommandType.CREATE_WORKER, payload=init_config.model_dump()
+    )
+    data = await _exec(supervisor, cmd, timeout=_WORKER_CREATE_TIMEOUT)
+    return WorkerInfo(**data)
 
 
 @router.get("/{name}")
 async def get_worker(
-    name: str, supervisor: WorkerSupervisor = Depends(get_supervisor)
-) -> dict[str, Any]:
-    cmd = CommandMessage(command=CommandType.GET_WORKERS)
+    name: str,
+    principal: PrincipalContext = Depends(authenticate_connection),
+    supervisor: WorkerSupervisor = Depends(get_supervisor),
+    node_id: str = Depends(get_node_id),
+    logger: logging.Logger = Depends(get_logger),
+) -> WorkerInfo:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.READ, logger
+    )
+    cmd = CommandMessage(command=CommandType.GET_WORKERS, payload={"worker_name": name})
     data = await _exec(supervisor, cmd)
-    workers: list[dict[str, Any]] = data.get("workers", [])
-    for w in workers:
-        if w.get("name") == name:
-            return w
+    if workers := [WorkerInfo(**w) for w in data.get("workers", [])]:
+        return workers[0]
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND, detail="Worker not found"
     )
@@ -71,8 +103,15 @@ async def get_worker(
 
 @router.post("/{name}/start")
 async def start_worker(
-    name: str, supervisor: WorkerSupervisor = Depends(get_supervisor)
+    name: str,
+    principal: PrincipalContext = Depends(authenticate_connection),
+    supervisor: WorkerSupervisor = Depends(get_supervisor),
+    node_id: str = Depends(get_node_id),
+    logger: logging.Logger = Depends(get_logger),
 ) -> None:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.WRITE, logger
+    )
     cmd = CommandMessage(
         command=CommandType.START_WORKER, payload={"worker_name": name}
     )
@@ -86,8 +125,15 @@ async def start_worker(
 
 @router.post("/{name}/stop")
 async def stop_worker(
-    name: str, supervisor: WorkerSupervisor = Depends(get_supervisor)
+    name: str,
+    principal: PrincipalContext = Depends(authenticate_connection),
+    supervisor: WorkerSupervisor = Depends(get_supervisor),
+    node_id: str = Depends(get_node_id),
+    logger: logging.Logger = Depends(get_logger),
 ) -> None:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.WRITE, logger
+    )
     cmd = CommandMessage(command=CommandType.STOP_WORKER, payload={"worker_name": name})
     data = await _exec(supervisor, cmd)
     if not data.get("success"):
@@ -99,8 +145,15 @@ async def stop_worker(
 
 @router.delete("/{name}")
 async def destroy_worker(
-    name: str, supervisor: WorkerSupervisor = Depends(get_supervisor)
+    name: str,
+    principal: PrincipalContext = Depends(authenticate_connection),
+    supervisor: WorkerSupervisor = Depends(get_supervisor),
+    node_id: str = Depends(get_node_id),
+    logger: logging.Logger = Depends(get_logger),
 ) -> None:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.WRITE, logger
+    )
     cmd = CommandMessage(
         command=CommandType.DESTROY_WORKER, payload={"worker_name": name}
     )
@@ -109,8 +162,15 @@ async def destroy_worker(
 
 @router.delete("")
 async def destroy_all_workers(
-    request: Request, supervisor: WorkerSupervisor = Depends(get_supervisor)
+    request: Request,
+    principal: PrincipalContext = Depends(authenticate_connection),
+    supervisor: WorkerSupervisor = Depends(get_supervisor),
+    node_id: str = Depends(get_node_id),
+    logger: logging.Logger = Depends(get_logger),
 ) -> None:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.WRITE, logger
+    )
     body = await request.body()
     names: list[str] | None = None
     if body.strip():

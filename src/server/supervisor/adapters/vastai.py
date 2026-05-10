@@ -7,10 +7,17 @@ from pydantic import PrivateAttr, SecretStr
 from vastai import VastAI  # type: ignore
 
 from ... import env
+from ...hooks import PrincipalContext
 from ...utils.helpers import ResourcePool, get_logger
 from ..resource_manager import GpuArch
 from ..schemas import WorkerHardware, WorkerInfo, WorkerStatus
-from .base import WorkerAdapter, WorkerConfig, WorkerFactory, WorkerTokenType
+from .base import (
+    ProviderSpec,
+    WorkerAdapter,
+    WorkerConfig,
+    WorkerFactory,
+    WorkerTokenType,
+)
 from .utils import env_to_secret_str, get_worker_image_name, to_env_str
 
 _PROVIDER_NAME = "vastai"
@@ -91,8 +98,9 @@ class VastAIWorkerAdapter(WorkerAdapter):
         config: VastAIWorkerConfig,
         vastai_client: VastAI,
         instance_pool: ResourcePool[int],
+        owner: PrincipalContext,
     ) -> None:
-        super().__init__(token, name, config)
+        super().__init__(token, name, config, owner)
         self.config: VastAIWorkerConfig
         self._client = vastai_client
         self._instance_pool = instance_pool
@@ -360,7 +368,8 @@ class VastAIWorkerAdapter(WorkerAdapter):
 
 
 class VastAIWorkerFactory(WorkerFactory):
-    def __init__(self) -> None:
+    def __init__(self, system_principal: PrincipalContext) -> None:
+        super().__init__(system_principal)
         self._client_cache: dict[str, VastAI] = {}
         self._worker_id_registry: Counter[str] = Counter()
         self._instance_pool = ResourcePool[int]()
@@ -384,6 +393,7 @@ class VastAIWorkerFactory(WorkerFactory):
             config=config,
             vastai_client=client,
             instance_pool=self._instance_pool,
+            owner=self.system_principal,
         )
 
     def destroy_worker(self, worker: WorkerAdapter) -> None:
@@ -404,3 +414,12 @@ class VastAIWorkerFactory(WorkerFactory):
         next_id = self._worker_id_registry[prefix]
         self._worker_id_registry[prefix] += 1
         return f"{prefix}{next_id}"
+
+
+def get_provider_spec(system_principal: PrincipalContext) -> ProviderSpec:
+    return ProviderSpec(
+        name=_PROVIDER_NAME,
+        config_cls=VastAIWorkerConfig,
+        adapter_cls=VastAIWorkerAdapter,
+        factory=VastAIWorkerFactory(system_principal),
+    )

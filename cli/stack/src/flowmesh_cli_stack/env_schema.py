@@ -55,7 +55,6 @@ STACK_ENV_SCHEMA = EnvSchema(
                 EnvVar("NODE_ALIAS", "node"),
                 EnvVar("NODE_TAGS", var_type=EnvVarType.CSV),
                 EnvVar("ENABLE_SUPERVISOR", "true", var_type=EnvVarType.BOOL),
-                EnvVar("SERVER_TOKEN", warn_if_empty=True),
                 EnvVar("SERVER_HOST", "localhost", required=True),
                 EnvVar(
                     "SERVER_HTTP_PORT",
@@ -457,6 +456,11 @@ STACK_ENV_SCHEMA = EnvSchema(
                     url_schemes={"http", "https"},
                 ),
                 EnvVar(
+                    "FLOWMESH_API_KEY",
+                    description="Supplier API key for worker authentication with "
+                    "the server",
+                ),
+                EnvVar(
                     "NEBULA_API_BASE_URL",
                     var_type=EnvVarType.URL,
                     url_schemes={"http", "https"},
@@ -506,12 +510,22 @@ STACK_ENV_SCHEMA = EnvSchema(
         EnvSection(
             title="External Plugins",
             description=[
-                "# Comma-separated module names imported at server startup. Each ",
-                "# named module must expose `install()`, which registers entries ",
-                "# into server.hooks.IDENTITY_PROVIDERS / SUBMISSION_GUARDS / ",
-                "# USAGE_SINKS. Leave empty in OSS unless you ship a plugin.",
+                "Plugins are Python packages dropped under FLOWMESH_PLUGIN_DIR ",
+                "(host-mounted to /app/plugins on the server) and selected by ",
+                "FLOWMESH_PLUGINS as a comma-separated list of top-level module ",
+                "names. Each named module must expose `install()` returning a ",
+                "`HookBindings`. Leave both empty unless you ship a plugin.",
             ],
-            vars=[EnvVar("FLOWMESH_PLUGINS", "")],
+            vars=[
+                EnvVar(
+                    "FLOWMESH_PLUGIN_DIR",
+                    "./plugins",
+                    var_type=EnvVarType.DIR_PATH,
+                    use_default=True,
+                    ensure_path="create",
+                ),
+                EnvVar("FLOWMESH_PLUGINS", ""),
+            ],
         ),
         EnvSection(
             title="Agent Executor (youtu-agent / utu)",

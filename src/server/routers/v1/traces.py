@@ -1,5 +1,6 @@
 """Trace endpoints — per-task upload, workflow-level read + analyzer."""
 
+import logging
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
@@ -9,8 +10,14 @@ from fastapi.responses import StreamingResponse
 
 from shared.utils.json import encode_jsonl_bytes, read_jsonl
 
-from ...app_state import get_results_dir, get_workflow_registry
+from ...app_state import get_logger, get_results_dir, get_workflow_registry
+from ...auth.security import (
+    PrincipalContext,
+    authenticate_connection,
+    require_permission,
+)
 from ...governance import ProfileSummary, analyze
+from ...hooks import ResourceAction, ResourceKind
 from ...registries.workflow import WorkflowRegistry
 from ...schemas.common import PathResponse
 from ...schemas.result import result_file_path
@@ -53,9 +60,14 @@ async def _resolve_task_ids(workflow_id: str, registry: WorkflowRegistry) -> lis
 )
 async def analyze_workflow_trace(
     workflow_id: str,
+    principal: PrincipalContext = Depends(authenticate_connection),
     registry: WorkflowRegistry = Depends(get_workflow_registry),
     results_dir: Path = Depends(get_results_dir),
+    logger: logging.Logger = Depends(get_logger),
 ) -> ProfileSummary:
+    await require_permission(
+        principal, ResourceKind.WORKFLOW, workflow_id, ResourceAction.READ, logger
+    )
     task_ids = await _resolve_task_ids(workflow_id, registry)
     spans = list(_iter_workflow_jsonl(results_dir, task_ids, "spans.jsonl"))
     assets = list(_iter_workflow_jsonl(results_dir, task_ids, "assets.jsonl"))
@@ -70,9 +82,14 @@ async def analyze_workflow_trace(
 async def get_workflow_trace(
     workflow_id: str,
     trace_type: str,
+    principal: PrincipalContext = Depends(authenticate_connection),
     registry: WorkflowRegistry = Depends(get_workflow_registry),
     results_dir: Path = Depends(get_results_dir),
+    logger: logging.Logger = Depends(get_logger),
 ) -> StreamingResponse:
+    await require_permission(
+        principal, ResourceKind.WORKFLOW, workflow_id, ResourceAction.READ, logger
+    )
     filename = _TYPE_TO_FILENAME.get(trace_type)
     if filename is None:
         raise HTTPException(
@@ -94,6 +111,7 @@ async def upload_task_trace(
     task_id: str,
     trace_type: str,
     file: UploadFile = File(...),
+    _: PrincipalContext = Depends(authenticate_connection),
     results_dir: Path = Depends(get_results_dir),
 ) -> PathResponse:
     filename = _TYPE_TO_FILENAME.get(trace_type)

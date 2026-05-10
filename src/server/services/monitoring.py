@@ -4,7 +4,8 @@ import logging
 import shutil
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from concurrent.futures import Future
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -20,6 +21,7 @@ from shared.schemas.event import (
 from shared.schemas.worker import WorkerStatus
 from shared.utils.manifest import RESULTS_NAME, sync_manifest
 
+from ..auth import default_principal, deregister_resource, register_resource
 from ..clients.redis import (
     NODE_EVENT_CHANNEL,
     TASK_EVENT_CHANNEL,
@@ -34,7 +36,13 @@ from ..clients.redis import (
     workflow_tasks_key,
 )
 from ..dispatcher import Dispatcher
-from ..hooks import USAGE_SINKS, UsageRow
+from ..hooks import (
+    RESOURCE_REGISTRARS,
+    USAGE_SINKS,
+    PrincipalContext,
+    ResourceKind,
+    UsageRow,
+)
 from ..registries.node import NodeRegistry
 from ..registries.worker import WorkerRegistry
 from ..schemas.logs import LogEvent
@@ -55,7 +63,6 @@ class EventMonitor:
     def __init__(
         self,
         redis_client: SyncRedisClient,
-        stop_event: threading.Event,
         logger: logging.Logger,
         runtime: TaskRuntime,
         dispatcher: Dispatcher,
@@ -69,7 +76,7 @@ class EventMonitor:
         log_stream_ttl_sec: int = 0,
     ) -> None:
         self._redis_client = redis_client
-        self._stop_event = stop_event
+        self._stop_event = threading.Event()
         self._logger = logger
         self._runtime = runtime
         self._dispatcher = dispatcher
@@ -86,13 +93,24 @@ class EventMonitor:
         self._pending_lock = threading.RLock()
 
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._threads: list[threading.Thread] | None = None
+        self._pending_coros: set[Future[Any]] = set()
+        self._pending_coros_lock = threading.Lock()
+
+        # Own-node tracking to coordinate with `stop()` during lifespan teardown.
+        # Set by `set_own_node()` once the supervisor handshake produces a node_id.
+        self._own_node_id: str | None = None
+        self._own_node_deregistered: asyncio.Event = asyncio.Event()
 
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
 
-    def start(self) -> list[threading.Thread]:
+    def start(self) -> None:
         """Spawn task/worker listener threads."""
+        if self._threads is not None:
+            self._logger.warning("Event monitor already started")
+            return
         if self._loop is None:
             try:
                 self._loop = asyncio.get_running_loop()
@@ -100,7 +118,7 @@ class EventMonitor:
                 raise RuntimeError(
                     "Event monitor must be started inside an event loop: %s", exc
                 )
-        threads = [
+        self._threads = [
             threading.Thread(
                 target=self._tasks_events_loop, name="tasks-events", daemon=True
             ),
@@ -111,9 +129,61 @@ class EventMonitor:
                 target=self._node_events_loop, name="nodes-events", daemon=True
             ),
         ]
-        for thread in threads:
+        for thread in self._threads:
             thread.start()
-        return threads
+
+    def set_own_node(self, node_id: str) -> None:
+        """Record the node_id of the supervisor co-located with this server."""
+        self._own_node_id = node_id
+
+    async def stop(
+        self,
+        thread_join_timeout: float = 2.0,
+        coro_timeout: float = 5.0,
+        deregister_timeout: float = 5.0,
+    ) -> None:
+        """Drain in-flight events and pending hook coroutines, then exit."""
+        if self._threads is None:
+            self._logger.warning("Event monitor not started")
+            return
+
+        if self._own_node_id is not None:
+            try:
+                await asyncio.wait_for(
+                    self._own_node_deregistered.wait(), timeout=deregister_timeout
+                )
+            except TimeoutError:
+                self._logger.warning(
+                    "EventMonitor.stop: SV_UNREGISTER for own node %s did not "
+                    "fire within %ss; deregister hook may have been missed",
+                    self._own_node_id,
+                    deregister_timeout,
+                )
+
+        self._stop_event.set()
+        for thread in self._threads:
+            thread.join(timeout=thread_join_timeout)
+        self._threads = None
+
+        with self._pending_coros_lock:
+            pending = list(self._pending_coros)
+            self._pending_coros.clear()
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *(asyncio.wrap_future(f) for f in pending),
+                    return_exceptions=True,
+                ),
+                timeout=coro_timeout,
+            )
+        except TimeoutError:
+            self._logger.warning(
+                "EventMonitor.stop: %d hook coroutine(s) did not finish within %ss",
+                len(pending),
+                coro_timeout,
+            )
 
     def mirror_task_results(self, parent_task_id: str, child_ids: list[str]) -> None:
         if not child_ids:
@@ -381,8 +451,14 @@ class EventMonitor:
         event_type = event.type
         match event_type:
             case "SV_REGISTER":
-                # This has already been handled in the registration endpoint
-                pass
+                # Registry is already populated by the supervisor's lifecycle
+                # Fire the register hook with the actor stamped on the event.
+                self._schedule_register(
+                    ResourceKind.NODE,
+                    event.node_id,
+                    self._actor_from_event(event),
+                    {"tags": list(event.tags or [])},
+                )
             case "SV_HEARTBEAT":
                 ttl_sec = event.payload.get("ttl_sec", 120)
                 current_gpu_count = event.payload.get("current_gpu_count")
@@ -398,6 +474,11 @@ class EventMonitor:
                 )
             case "SV_UNREGISTER":
                 self._node_registry.unregister_node(event.node_id)
+                actor = self._actor_from_event(event)
+                if self._own_node_id is not None and event.node_id == self._own_node_id:
+                    self._schedule_own_node_deregister(event.node_id, actor)
+                else:
+                    self._schedule_deregister(ResourceKind.NODE, event.node_id, actor)
             case _:
                 self._logger.debug(
                     "Ignoring node event type=%s payload=%s",
@@ -430,8 +511,14 @@ class EventMonitor:
         event_type = event.type
         match event_type:
             case "REGISTER":
-                # This has already been handled in the registration endpoint
-                pass
+                worker_id = (event.worker_id or "").strip()
+                if worker_id:
+                    self._schedule_register(
+                        ResourceKind.WORKER,
+                        worker_id,
+                        self._actor_from_event(event),
+                        {"tags": list(event.tags or [])},
+                    )
             case "HEARTBEAT":
                 worker_id = (event.worker_id or "").strip()
                 ttl_sec = event.payload.get("ttl_sec", 120)
@@ -446,6 +533,9 @@ class EventMonitor:
                 worker_id = (event.worker_id or "").strip()
                 self._worker_registry.unregister_workers(worker_id)
                 if worker_id:
+                    self._schedule_deregister(
+                        ResourceKind.WORKER, worker_id, self._actor_from_event(event)
+                    )
                     if self._watchdog.enabled and self._watchdog.is_marked_dead(
                         worker_id
                     ):
@@ -538,15 +628,113 @@ class EventMonitor:
         payload["ssh"] = ssh_payload
         return payload
 
+    def _track_pending(self, fut: Future[Any]) -> None:
+        fut.add_done_callback(self._untrack_pending)
+        with self._pending_coros_lock:
+            if not fut.done():
+                self._pending_coros.add(fut)
+
+    def _untrack_pending(self, fut: Future[Any]) -> None:
+        with self._pending_coros_lock:
+            self._pending_coros.discard(fut)
+
     def _schedule_emit_usage(self, usages: list[tuple[str, TaskUsage]]) -> None:
         if not usages or not USAGE_SINKS:
             return
         if self._loop is None:
             return
         try:
-            asyncio.run_coroutine_threadsafe(self._emit_usage_async(usages), self._loop)
+            fut = asyncio.run_coroutine_threadsafe(
+                self._emit_usage_async(usages), self._loop
+            )
         except RuntimeError as exc:
             self._logger.debug("Failed to schedule usage delivery: %s", exc)
+            return
+        self._track_pending(fut)
+
+    def _actor_from_event(self, event: WorkerEvent | NodeEvent) -> PrincipalContext:
+        return (
+            default_principal()
+            if event.actor is None
+            else PrincipalContext.model_validate(event.actor)
+        )
+
+    def _schedule_register(
+        self,
+        resource_kind: ResourceKind,
+        resource_id: str,
+        principal: PrincipalContext,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        if not RESOURCE_REGISTRARS or not resource_id or self._loop is None:
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                register_resource(
+                    principal, resource_kind, resource_id, metadata, self._logger
+                ),
+                self._loop,
+            )
+        except RuntimeError as exc:
+            self._logger.debug(
+                "Failed to schedule %s/%s register: %s",
+                resource_kind.value,
+                resource_id,
+                exc,
+            )
+            return
+        self._track_pending(fut)
+
+    def _schedule_deregister(
+        self, resource_kind: ResourceKind, resource_id: str, principal: PrincipalContext
+    ) -> None:
+        if not RESOURCE_REGISTRARS or not resource_id or self._loop is None:
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                deregister_resource(
+                    principal, resource_kind, resource_id, self._logger
+                ),
+                self._loop,
+            )
+        except RuntimeError as exc:
+            self._logger.debug(
+                "Failed to schedule %s/%s deregister: %s",
+                resource_kind.value,
+                resource_id,
+                exc,
+            )
+            return
+        self._track_pending(fut)
+
+    def _schedule_own_node_deregister(
+        self, node_id: str, principal: PrincipalContext
+    ) -> None:
+        """Schedule the deregister for the co-located supervisor's node and
+        signal `_own_node_deregistered` once the coroutine completes."""
+
+        def on_done(*_: Any) -> None:
+            self._own_node_deregistered.set()
+
+        if self._loop is None:
+            return
+        if not RESOURCE_REGISTRARS:
+            self._loop.call_soon_threadsafe(on_done)
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                deregister_resource(
+                    principal, ResourceKind.NODE, node_id, self._logger
+                ),
+                self._loop,
+            )
+            fut.add_done_callback(on_done)
+        except RuntimeError as exc:
+            self._logger.debug(
+                "Failed to schedule own-node %s deregister: %s", node_id, exc
+            )
+            return
+        self._track_pending(fut)
 
     async def _emit_usage_async(self, usages: list[tuple[str, TaskUsage]]) -> None:
         if not usages or not USAGE_SINKS:
@@ -625,8 +813,6 @@ class EventMonitor:
     def _get_event_stream(self, topic: str) -> Iterable[Event]:
         pubsub = self._redis_client.subscribe_telemetry(topic)
         for data in iter_pubsub_messages(pubsub):
-            if self._stop_event.is_set():
-                break
             if not isinstance(data, dict):
                 self._logger.debug("Invalid %s payload: %s", topic, type(data))
                 continue
@@ -638,6 +824,12 @@ class EventMonitor:
                 )
                 continue
             yield event
+            # Stop AFTER yielding so a message that arrives concurrently with
+            # `stop_event.set()` (e.g. SV_UNREGISTER published while the
+            # supervisor subprocess is shutting down) still reaches the
+            # handler and gets a chance to schedule its hook coroutine.
+            if self._stop_event.is_set():
+                break
         try:
             pubsub.close()
         except Exception:

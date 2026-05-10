@@ -12,6 +12,13 @@ from ...app_state import (
     get_node_registry,
     get_worker_registry,
 )
+from ...auth.security import (
+    PrincipalContext,
+    authenticate_connection,
+    require_permission,
+    resolve_accessible_ids,
+)
+from ...hooks import ResourceAction, ResourceKind
 from ...registries import Node, NodeRegistry, WorkerRegistry
 from ...schemas.node import (
     NodeInfo,
@@ -33,10 +40,17 @@ router = APIRouter(prefix="/nodes", tags=["Nodes"])
 )
 async def list_nodes(
     request: Request,
+    principal: PrincipalContext = Depends(authenticate_connection),
     node_registry: NodeRegistry = Depends(get_node_registry),
+    logger: logging.Logger = Depends(get_logger),
 ) -> list[Node]:
     queries = request.query_params
     nodes = await node_registry.list_nodes_async()
+    allowed = await resolve_accessible_ids(
+        principal, ResourceKind.NODE, ResourceAction.READ, logger
+    )
+    if allowed is not None:
+        nodes = [node for node in nodes if node.id in allowed]
     return filter_models_by_queries(nodes, queries)
 
 
@@ -56,6 +70,7 @@ async def list_nodes(
 )
 async def list_all_workers(
     request: Request,
+    principal: PrincipalContext = Depends(authenticate_connection),
     node_registry: NodeRegistry = Depends(get_node_registry),
     worker_registry: WorkerRegistry = Depends(get_worker_registry),
     logger: logging.Logger = Depends(get_logger),
@@ -77,6 +92,11 @@ async def list_all_workers(
             continue
         all_workers.extend(result)
 
+    allowed = await resolve_accessible_ids(
+        principal, ResourceKind.WORKER, ResourceAction.READ, logger
+    )
+    if allowed is not None:
+        all_workers = [w for w in all_workers if w.id in allowed]
     filtered = filter_models_by_queries(all_workers, request.query_params)
     return filtered
 
@@ -90,8 +110,13 @@ async def list_all_workers(
 )
 async def register_node(
     node_info: NodeInfo,
+    principal: PrincipalContext = Depends(authenticate_connection),
     node_registry: NodeRegistry = Depends(get_node_registry),
+    logger: logging.Logger = Depends(get_logger),
 ) -> NodeRegisterResponse:
+    await require_permission(
+        principal, ResourceKind.NODE, None, ResourceAction.WRITE, logger
+    )
     node_id = await node_registry.register_node_async(node_info)
     return NodeRegisterResponse(node_id=node_id)
 
@@ -113,11 +138,20 @@ async def register_node(
 async def list_node_workers(
     node_id: str,
     request: Request,
+    principal: PrincipalContext = Depends(authenticate_connection),
     node_registry: NodeRegistry = Depends(get_node_registry),
     worker_registry: WorkerRegistry = Depends(get_worker_registry),
     logger: logging.Logger = Depends(get_logger),
 ) -> list[NodeWorkerInfo]:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.READ, logger
+    )
     workers = await _fetch_node_workers(node_id, node_registry, worker_registry, logger)
+    allowed = await resolve_accessible_ids(
+        principal, ResourceKind.WORKER, ResourceAction.READ, logger
+    )
+    if allowed is not None:
+        workers = [w for w in workers if w.id in allowed]
     filtered = filter_models_by_queries(workers, request.query_params)
     return filtered
 
@@ -126,15 +160,20 @@ async def list_node_workers(
     "/{node_id}/workers/register",
     summary="Register a worker",
     description="Register a new worker for a node.",
-    response_description="Worker ID and API key",
+    response_description="Worker ID",
     status_code=status.HTTP_201_CREATED,
 )
 async def register_worker(
     node_id: str,
     request: Request,
+    principal: PrincipalContext = Depends(authenticate_connection),
     node_registry: NodeRegistry = Depends(get_node_registry),
     worker_registry: WorkerRegistry = Depends(get_worker_registry),
+    logger: logging.Logger = Depends(get_logger),
 ) -> WorkerRegisterResponse:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.WRITE, logger
+    )
     node = await node_registry.get_node_async(node_id)
     if node is None:
         raise HTTPException(
@@ -142,9 +181,9 @@ async def register_worker(
         )
     worker_meta = await request.json()
     worker_id = await worker_registry.register_worker_async(
-        node_id, node.alias, "", worker_meta
+        node_id, node.alias, worker_meta
     )
-    return WorkerRegisterResponse(worker_id=worker_id, api_key="")
+    return WorkerRegisterResponse(worker_id=worker_id)
 
 
 @router.post(
@@ -156,8 +195,13 @@ async def register_worker(
 async def start_node_worker(
     node_id: str,
     worker_name: str,
+    principal: PrincipalContext = Depends(authenticate_connection),
     node_registry: NodeRegistry = Depends(get_node_registry),
+    logger: logging.Logger = Depends(get_logger),
 ) -> None:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.WRITE, logger
+    )
     cmd = CommandMessage(
         command=CommandType.START_WORKER, payload={"worker_name": worker_name}
     )
@@ -191,8 +235,13 @@ async def start_node_worker(
 async def stop_node_worker(
     node_id: str,
     worker_name: str,
+    principal: PrincipalContext = Depends(authenticate_connection),
     node_registry: NodeRegistry = Depends(get_node_registry),
+    logger: logging.Logger = Depends(get_logger),
 ) -> None:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.WRITE, logger
+    )
     cmd = CommandMessage(
         command=CommandType.STOP_WORKER, payload={"worker_name": worker_name}
     )
@@ -225,8 +274,13 @@ async def stop_node_worker(
 )
 async def get_node(
     node_id: str,
+    principal: PrincipalContext = Depends(authenticate_connection),
     node_registry: NodeRegistry = Depends(get_node_registry),
+    logger: logging.Logger = Depends(get_logger),
 ) -> Node:
+    await require_permission(
+        principal, ResourceKind.NODE, node_id, ResourceAction.READ, logger
+    )
     node = await node_registry.get_node_async(node_id)
     if not node:
         raise HTTPException(

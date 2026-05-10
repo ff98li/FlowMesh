@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -11,11 +12,19 @@ from shared.schemas.command import StopMessage
 from shared.tasks import TaskType
 
 from ...app_state import (
+    get_logger,
     get_redis_client,
     get_runtime,
     get_worker_registry,
 )
+from ...auth.security import (
+    PrincipalContext,
+    authenticate_connection,
+    require_permission,
+    resolve_accessible_ids,
+)
 from ...clients.redis import RedisClient, task_log_closed_key, task_log_stream_key
+from ...hooks import ResourceAction, ResourceKind
 from ...registries.worker import WorkerRegistry
 from ...schemas.common import OkResponse
 from ...schemas.logs import LogEntry, LogEvent, LogQueryResponse
@@ -48,9 +57,16 @@ def _sanitize_latest_update(info: TaskInfo) -> None:
 )
 async def list_tasks(
     request: Request,
+    principal: PrincipalContext = Depends(authenticate_connection),
     runtime: TaskRuntime = Depends(get_runtime),
+    logger: logging.Logger = Depends(get_logger),
 ) -> list[TaskInfo]:
     tasks = runtime.list_tasks()
+    allowed = await resolve_accessible_ids(
+        principal, ResourceKind.TASK, ResourceAction.READ, logger
+    )
+    if allowed is not None:
+        tasks = [task for task in tasks if task.task_id in allowed]
     for task in tasks:
         _sanitize_latest_update(task)
     return filter_models_by_queries(tasks, request.query_params)
@@ -64,8 +80,13 @@ async def list_tasks(
 )
 async def get_task(
     task_id: str = ApiPath(..., min_length=1),
+    principal: PrincipalContext = Depends(authenticate_connection),
     runtime: TaskRuntime = Depends(get_runtime),
+    logger: logging.Logger = Depends(get_logger),
 ) -> TaskInfo:
+    await require_permission(
+        principal, ResourceKind.TASK, task_id, ResourceAction.READ, logger
+    )
     info = runtime.describe_task(task_id)
     if not info:
         raise HTTPException(
@@ -86,9 +107,14 @@ async def get_task(
 )
 async def stop_task(
     task_id: str = ApiPath(..., min_length=1),
+    principal: PrincipalContext = Depends(authenticate_connection),
     runtime: TaskRuntime = Depends(get_runtime),
     worker_registry: WorkerRegistry = Depends(get_worker_registry),
+    logger: logging.Logger = Depends(get_logger),
 ) -> OkResponse:
+    await require_permission(
+        principal, ResourceKind.TASK, task_id, ResourceAction.CANCEL, logger
+    )
     record = runtime.get_record(task_id)
     if record is None:
         raise HTTPException(
@@ -154,8 +180,13 @@ async def get_task_logs(
             '(example: `"1707349300000-0"`).'
         ),
     ),
+    principal: PrincipalContext = Depends(authenticate_connection),
     redis: RedisClient = Depends(get_redis_client),
+    logger: logging.Logger = Depends(get_logger),
 ) -> LogQueryResponse:
+    await require_permission(
+        principal, ResourceKind.RESULT, task_id, ResourceAction.READ, logger
+    )
     limit = max(1, min(10_000, int(limit)))
     if before and after:
         raise HTTPException(
@@ -242,8 +273,13 @@ async def stream_task_logs(
             "takes precedence."
         ),
     ),
+    principal: PrincipalContext = Depends(authenticate_connection),
     redis: RedisClient = Depends(get_redis_client),
+    logger: logging.Logger = Depends(get_logger),
 ):
+    await require_permission(
+        principal, ResourceKind.RESULT, task_id, ResourceAction.READ, logger
+    )
     key = task_log_stream_key(task_id)
     if not await redis.asyncio.exists_telemetry(key):
         raise HTTPException(

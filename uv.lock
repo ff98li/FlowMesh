@@ -12,6 +12,7 @@ members = [
     "flowmesh",
     "flowmesh-cli",
     "flowmesh-cli-stack",
+    "flowmesh-hook",
     "flowmesh-sdk",
     "flowmesh-sdk-stack",
 ]
@@ -1726,6 +1727,9 @@ dev = [
     { name = "types-pyyaml" },
     { name = "types-requests" },
 ]
+hook = [
+    { name = "flowmesh-hook" },
+]
 inference = [
     { name = "accelerate" },
     { name = "datasets" },
@@ -1763,8 +1767,10 @@ server = [
     { name = "cryptography" },
     { name = "docker" },
     { name = "fastapi" },
+    { name = "flowmesh-hook" },
     { name = "grpcio" },
     { name = "httpx" },
+    { name = "lumid-hooks" },
     { name = "protobuf" },
     { name = "pydantic" },
     { name = "python-multipart" },
@@ -1825,6 +1831,8 @@ requires-dist = [
     { name = "fastembed", marker = "extra == 'rag'", specifier = ">=0.7.3,<0.8" },
     { name = "flashinfer-python", marker = "extra == 'inference-gpu'", specifier = ">=0.6.6" },
     { name = "flowmesh-cli", extras = ["stack"], marker = "extra == 'cli'", editable = "cli" },
+    { name = "flowmesh-hook", marker = "extra == 'hook'", editable = "hook" },
+    { name = "flowmesh-hook", marker = "extra == 'server'", editable = "hook" },
     { name = "flowmesh-sdk", marker = "extra == 'sdk'", editable = "sdk" },
     { name = "flowmesh-sdk-stack", marker = "extra == 'sdk'", editable = "sdk/stack" },
     { name = "google-genai", marker = "extra == 'agent'", specifier = ">=1.47.0" },
@@ -1838,6 +1846,7 @@ requires-dist = [
     { name = "isort", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "jinja2", marker = "extra == 'agent'", specifier = ">=3.1.6" },
     { name = "lumid-data-sdk", marker = "extra == 'analytics'", git = "https://github.com/mlsys-io/lumid.data.git?subdirectory=sdk&rev=a800051" },
+    { name = "lumid-hooks", marker = "extra == 'server'", git = "https://github.com/mlsys-io/lumid.hooks.git?rev=fdb9ddb9bf4203b18d073e5bab84f1173f32561a" },
     { name = "matplotlib", marker = "extra == 'agent'", specifier = ">=3.10.6" },
     { name = "mcp", marker = "extra == 'agent'", specifier = ">=1.23.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.19.1" },
@@ -1903,7 +1912,7 @@ requires-dist = [
     { name = "websockets", marker = "extra == 'server'", specifier = ">=15.0.1" },
     { name = "wikipedia-api", marker = "extra == 'agent'", specifier = ">=0.8.1" },
 ]
-provides-extras = ["server", "worker-core", "inference", "training", "rag", "inference-gpu", "training-gpu", "agent", "observability", "analytics", "dev", "cli", "sdk"]
+provides-extras = ["server", "worker-core", "inference", "training", "rag", "inference-gpu", "training-gpu", "agent", "observability", "analytics", "dev", "cli", "sdk", "hook"]
 
 [[package]]
 name = "flowmesh-cli"
@@ -1951,6 +1960,17 @@ requires-dist = [
     { name = "flowmesh-sdk-stack", specifier = ">=0.1.0" },
     { name = "pyyaml", specifier = ">=6.0.2" },
 ]
+
+[[package]]
+name = "flowmesh-hook"
+version = "0.1.0"
+source = { editable = "hook" }
+dependencies = [
+    { name = "lumid-hooks" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "lumid-hooks" }]
 
 [[package]]
 name = "flowmesh-sdk"
@@ -3170,6 +3190,14 @@ source = { git = "https://github.com/mlsys-io/lumid.data.git?subdirectory=sdk&re
 dependencies = [
     { name = "httpx" },
     { name = "httpx-sse" },
+    { name = "pydantic" },
+]
+
+[[package]]
+name = "lumid-hooks"
+version = "0.1.0"
+source = { git = "https://github.com/mlsys-io/lumid.hooks.git?rev=fdb9ddb9bf4203b18d073e5bab84f1173f32561a#fdb9ddb9bf4203b18d073e5bab84f1173f32561a" }
+dependencies = [
     { name = "pydantic" },
 ]
 

@@ -4,7 +4,9 @@ import threading
 from collections.abc import Callable
 
 import httpx
+from lumid_hooks import PrincipalContext
 
+from shared.schemas.event import NodeEvent, serialize_event
 from shared.schemas.node import NodeInfo
 from shared.utils.time import now_iso
 
@@ -26,6 +28,7 @@ class Lifecycle:
         hb_sec: int,
         hb_ttl_sec: int,
         logger: logging.Logger,
+        system_principal: PrincipalContext,
         current_gpu_count_getter: Callable[[], int] | None = None,
     ) -> None:
         self._redis = redis
@@ -36,6 +39,7 @@ class Lifecycle:
         self.hb_sec = hb_sec
         self.hb_ttl_sec = hb_ttl_sec
         self.logger = logger
+        self._system_principal = system_principal
         self._current_gpu_count_getter = current_gpu_count_getter
 
         self._node_id: str | None = None
@@ -43,6 +47,7 @@ class Lifecycle:
         self._stop_event.set()  # Initially stopped
         self._hb_thread: threading.Thread | None = None
         self._hb_lock = threading.Lock()
+        self._unregister_published: bool = False
 
     @property
     def node_id(self) -> str:
@@ -88,14 +93,15 @@ class Lifecycle:
     # ------------------------------------------------------------------ #
 
     def _publish_event(self, event_type: str, **extra: object) -> None:
-        payload = {
-            "type": event_type,
-            "node_id": self._node_id,
-            "ts": now_iso(),
-            "tags": [],
-            "payload": {},
-            **extra,
-        }
+        event = NodeEvent(
+            type=event_type,
+            ts=now_iso(),
+            node_id=self.node_id,
+            tags=[],
+            payload={},
+            actor=self._system_principal.model_dump(),
+        )
+        payload = serialize_event(event) | extra
         self._redis.publish_telemetry(NODE_EVENT_CHANNEL, json.dumps(payload))
 
     def _current_gpu_count(self) -> int | None:
@@ -133,6 +139,7 @@ class Lifecycle:
             return self.node_id
 
         self._node_id = self._register()
+        self._unregister_published = False
         self._publish_event("SV_REGISTER")
         self.heartbeat_now()
 
@@ -155,6 +162,12 @@ class Lifecycle:
                 )
             self._stop_event.wait(self.hb_sec)
 
+    def publish_unregister(self) -> None:
+        if self._unregister_published:
+            return
+        self._publish_event("SV_UNREGISTER")
+        self._unregister_published = True
+
     def stop(self) -> None:
         self._stop_event.set()
 
@@ -163,7 +176,7 @@ class Lifecycle:
             self._hb_thread = None
 
         try:
-            self._publish_event("SV_UNREGISTER")
+            self.publish_unregister()
         finally:
             try:
                 self._node_registry.unregister_node(self.node_id)

@@ -7,17 +7,10 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from .adapters.base import WorkerAdapter, WorkerConfig, WorkerTokenType
-from .adapters.docker import (
-    DockerWorkerAdapter,
-    DockerWorkerConfig,
-    DockerWorkerFactory,
-)
-from .adapters.vastai import (
-    VastAIWorkerAdapter,
-    VastAIWorkerConfig,
-    VastAIWorkerFactory,
-)
+from ..hooks import PrincipalContext
+from .adapters.base import ProviderSpec, WorkerAdapter, WorkerTokenType
+from .adapters.docker import get_provider_spec as docker_provider_spec
+from .adapters.vastai import get_provider_spec as vastai_provider_spec
 from .registry import WorkerRegistry
 from .schemas import WorkerInfo, WorkerStatus
 
@@ -62,6 +55,7 @@ class ServerWorkerConfig(BaseModel):
 class WorkerManager:
     def __init__(
         self,
+        system_principal: PrincipalContext,
         config_path: str,
         registry: WorkerRegistry,
         logger: logging.Logger,
@@ -74,6 +68,11 @@ class WorkerManager:
         self._default_worker_config: dict[str, Any] | None = None
         self._is_started: bool = False
         self._capacity_change_callback = capacity_change_callback
+        specs = [
+            docker_provider_spec(system_principal),
+            vastai_provider_spec(system_principal),
+        ]
+        self._providers: dict[str, ProviderSpec] = {spec.name: spec for spec in specs}
 
     @property
     def is_started(self) -> bool:
@@ -172,8 +171,8 @@ class WorkerManager:
 
         await self._stop_and_destroy_workers(self._registry.all_workers())
         self._report_capacity_change()
-        DockerWorkerFactory.get_instance().cleanup()
-        VastAIWorkerFactory.get_instance().cleanup()
+        for spec in self._providers.values():
+            spec.factory.cleanup()
         self._registry.clear()
         self._default_worker_config = None
         self._is_started = False
@@ -265,18 +264,11 @@ class WorkerManager:
         provider = init_config.provider.strip().lower()
         worker_config = (self._default_worker_config or {}) | init_config.worker_config
 
-        # Create worker adapter
-        config: WorkerConfig
-        worker: WorkerAdapter
-        match provider:
-            case "docker":
-                config = DockerWorkerConfig.model_validate(worker_config)
-                worker = DockerWorkerFactory.get_instance().create_worker(token, config)
-            case "vastai":
-                config = VastAIWorkerConfig.model_validate(worker_config)
-                worker = VastAIWorkerFactory.get_instance().create_worker(token, config)
-            case _:
-                raise ValueError(f"Unsupported worker provider: {provider}")
+        spec = self._providers.get(provider)
+        if spec is None:
+            raise ValueError(f"Unsupported worker provider: {provider}")
+        config = spec.config_cls.model_validate(worker_config)
+        worker = spec.factory.create_worker(token, config)
 
         try:
             self._registry.add(worker)
@@ -299,13 +291,11 @@ class WorkerManager:
         return True
 
     def _destroy_worker(self, worker: WorkerAdapter) -> None:
-        match worker:
-            case DockerWorkerAdapter():
-                DockerWorkerFactory.get_instance().destroy_worker(worker)
-            case VastAIWorkerAdapter():
-                VastAIWorkerFactory.get_instance().destroy_worker(worker)
-            case _:
-                raise ValueError(f"Unsupported worker type: {type(worker)}")
+        for spec in self._providers.values():
+            if isinstance(worker, spec.adapter_cls):
+                spec.factory.destroy_worker(worker)
+                return
+        raise ValueError(f"Unsupported worker type: {type(worker)}")
 
     def _report_capacity_change(self) -> None:
         callback = self._capacity_change_callback
