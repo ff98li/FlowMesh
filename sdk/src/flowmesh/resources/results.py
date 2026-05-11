@@ -7,6 +7,7 @@ from collections.abc import AsyncIterable, Iterable
 from pathlib import Path
 from typing import Any, Literal
 
+from ..models.results import ResultEnvelope
 from ._base import AsyncResource, SyncResource
 
 type BundleSection = Literal["results", "artifacts", "logs", "all"]
@@ -191,20 +192,18 @@ def _finalize_materialize(
     sections: tuple[BundleSection, ...],
     extracted: list[Path],
 ) -> tuple[dict[str, Any], Path, list[Path]]:
+    """Validate the envelope and point _artifacts at the local extracted dir."""
     json_path = output_dir / task_id / "results.json"
     if not json_path.is_file():
         return {}, json_path, extracted
 
-    payload = json.loads(json_path.read_text())
+    envelope = ResultEnvelope.model_validate_json(json_path.read_text())
     if _wants_artifacts(sections):
-        try:
-            ctx = payload["result"]["_artifacts"]
-            ctx["base_dir"] = (output_dir / task_id).resolve().as_posix()
-            ctx.pop("base_url", None)
-        except (KeyError, TypeError):
-            pass
-        else:
-            json_path.write_text(json.dumps(payload, indent=2))
+        ctx = envelope.result["_artifacts"]
+        ctx["base_dir"] = (output_dir / task_id).resolve().as_posix()
+        ctx.pop("base_url", None)
+    payload = envelope.model_dump(mode="json")
+    json_path.write_text(json.dumps(payload, indent=2))
     return payload, json_path, extracted
 
 

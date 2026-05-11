@@ -4,9 +4,8 @@
 # Stage 1 calls a chat completion endpoint and returns raw text.
 # Stage 2 sends Stage 1's returned text as the next prompt.
 #
-# NOTE: Replace $API_TOKEN in the Authorization headers below with a real
-# bearer token before submitting. The host does not expand environment
-# variables.
+# NOTE: Configure NEBULA_API_BASE_URL and NEBULA_API_TOKEN on the worker before
+# submitting. APIExecutor injects the Authorization header from NEBULA_API_TOKEN.
 
 apiVersion: flowmesh/v1
 kind: APITask
@@ -20,11 +19,9 @@ spec:
     - name: stage-1
       spec:
         api:
-          url: "https://llm.ai-nebula.com/v1/chat/completions"
           method: "POST"
           headers:
             Content-Type: "application/json"
-            Authorization: "Bearer $API_TOKEN"
           body:
             model: "gpt-4o"
             messages:
@@ -39,16 +36,14 @@ spec:
     - name: stage-2
       spec:
         api:
-          url: "https://llm.ai-nebula.com/v1/chat/completions"
           method: "POST"
           headers:
             Content-Type: "application/json"
-            Authorization: "Bearer $API_TOKEN"
           body:
             model: "gpt-4o"
             messages:
               - role: "user"
-                content: "The previous stage's response is as follows. Please provide a simpler explanation: \n${stage-1.result.text}"
+                content: "The previous stage's response is as follows. Please provide a simpler explanation: \n${stage-1.text}"
           response:
             parse_json: true
             # return_body is a JSON backdoor: keep raw text when JSON isn't usable.
