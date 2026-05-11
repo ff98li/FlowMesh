@@ -1,4 +1,4 @@
-name: Unit Tests
+name: Package Build
 
 on:
   push:
@@ -20,9 +20,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit-tests:
-    name: Unit tests
-    runs-on: [self-hosted, cuda]
+  package-build:
+    name: Build and smoke-test packages
+    runs-on: self-hosted
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
@@ -34,13 +34,11 @@ jobs:
         with:
           version: "0.11.8"
 
-      - name: Install dependencies
-        run: uv sync --all-packages --group ci --frozen
+      - name: Install build environment
+        run: uv sync --all-packages --group dev --frozen
 
-      - name: Run unit tests
-        # Skip the multiprocessing GPU-cleanup test — it's too costly to
-        # run on every PR (vllm engine startup + multi-process cleanup).
-        run: >
-          uv run pytest tests/
-          --ignore=tests/worker/test_mp_executor_cleanup_gpu.py
-          -v
+      - name: Build distributions
+        run: uv build --all-packages --out-dir dist
+
+      - name: Verify distributions
+        run: uv run scripts/ci/check_package_build.py --dist dist
