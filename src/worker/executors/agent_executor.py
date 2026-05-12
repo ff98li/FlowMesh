@@ -37,6 +37,21 @@ DEFAULT_CONFIG_NAME = "default"
 DEFAULT_SHUFFLE_SEED = 42
 DEFAULT_DATASET_SPLIT = "train"
 DEFAULT_DATASET_COLUMN = "text"
+DEFAULT_AGENT_TASK_TIMEOUT_SEC = 600
+
+
+def _resolve_task_timeout(agent: dict[str, Any] | None) -> int:
+    if not agent:
+        return DEFAULT_AGENT_TASK_TIMEOUT_SEC
+    raw = agent.get("timeout")
+    if raw is None:
+        return DEFAULT_AGENT_TASK_TIMEOUT_SEC
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+        raise ExecutionError(
+            f"spec.agent.timeout must be a positive integer (seconds), got {raw!r}"
+        )
+    return raw
+
 
 logger = logging.getLogger("worker.agent")
 
@@ -221,6 +236,7 @@ class AgentExecutor(Executor):
 
         spec = self.require_spec(task, AgentSpecStrict)
         agent_config_name = spec.configName or DEFAULT_CONFIG_NAME
+        task_timeout = _resolve_task_timeout(spec.agent)
 
         # Prepare tasks from various data sources
         self.prepare_data(spec)
@@ -232,7 +248,9 @@ class AgentExecutor(Executor):
             if len(self._tasks) == 1:
                 # Single task execution (backward compatible)
                 result = asyncio.run(
-                    self._run_agent_task(agent_config_name, self._tasks[0], out_dir)
+                    self._run_agent_task(
+                        agent_config_name, self._tasks[0], out_dir, task_timeout
+                    )
                 )
 
                 output: dict[str, Any] = {
@@ -263,7 +281,9 @@ class AgentExecutor(Executor):
             else:
                 # Batch execution for multiple tasks
                 results = asyncio.run(
-                    self._run_agent_tasks_batch(agent_config_name, self._tasks, out_dir)
+                    self._run_agent_tasks_batch(
+                        agent_config_name, self._tasks, out_dir, task_timeout
+                    )
                 )
 
                 # Transform batch results to standard format
@@ -332,10 +352,17 @@ class AgentExecutor(Executor):
             raise ExecutionError(f"Agent execution failed: {e}") from e
 
     async def _run_agent_task(
-        self, config_name: str, task_input: str, out_dir: Path
+        self,
+        config_name: str,
+        task_input: str,
+        out_dir: Path,
+        task_timeout: int,
     ) -> dict[str, Any]:
-        """Execute agent task using utu framework with detailed logging and timeout
-        control"""
+        """Execute a single agent task end-to-end via the utu framework.
+
+        Streams progress events, enforces ``task_timeout`` on the streaming
+        run, and writes the final agent output to ``artifacts/agent_output.txt``.
+        """
         import asyncio
 
         from utu.agents import get_agent  # type: ignore # noqa: F401
@@ -361,8 +388,6 @@ class AgentExecutor(Executor):
 
         execution_log = []
         usage_stats: dict[str, Any] = {}
-
-        task_timeout = 600  # 10 minute timeout
 
         try:
             # Load agent configuration
@@ -407,87 +432,94 @@ class AgentExecutor(Executor):
             logger.info("Using streaming execution with progress tracking...")
             result_streaming = agent.run_streamed(input=task_input)
 
-            # Monitor execution stream
-            async for event in result_streaming.stream_events():
-                # Check agent switching events
-                if hasattr(event, "new_agent") and event.new_agent:
-                    agent_name = getattr(event.new_agent, "name", "Unknown")
-                    logger.info(f"🤖 Agent switched: {agent_name}")
-                    execution_log.append(f"Agent switched: {agent_name}")
+            # ``asyncio.timeout`` wraps the entire streaming run so the
+            # deadline applies even when the agent stalls before emitting an
+            # event — a bare ``async for`` would otherwise block forever.
+            async with asyncio.timeout(task_timeout):
+                # Monitor execution stream
+                async for event in result_streaming.stream_events():
+                    # Check agent switching events
+                    if hasattr(event, "new_agent") and event.new_agent:
+                        agent_name = getattr(event.new_agent, "name", "Unknown")
+                        logger.info(f"🤖 Agent switched: {agent_name}")
+                        execution_log.append(f"Agent switched: {agent_name}")
 
-                # Check Orchestra task planning events
-                elif hasattr(event, "name") and hasattr(event, "item"):
-                    if event.name == "plan":
-                        logger.info("📋 Task planning completed")
-                        execution_log.append("Task planning completed")
-                        if event.item:
-                            plan_summary = str(event.item)[:200]
-                            logger.info(f"📝 Planning content: {plan_summary}...")
+                    # Check Orchestra task planning events
+                    elif hasattr(event, "name") and hasattr(event, "item"):
+                        if event.name == "plan":
+                            logger.info("📋 Task planning completed")
+                            execution_log.append("Task planning completed")
+                            if event.item:
+                                plan_summary = str(event.item)[:200]
+                                logger.info(f"📝 Planning content: {plan_summary}...")
 
-                # Check RunItem events (tool calls, outputs, etc.)
-                elif hasattr(event, "item") and hasattr(event.item, "type"):
-                    item = event.item
-                    item_type = item.type
-                    agent_name = getattr(
-                        getattr(item, "agent", None), "name", "Unknown"
-                    )
+                    # Check RunItem events (tool calls, outputs, etc.)
+                    elif hasattr(event, "item") and hasattr(event.item, "type"):
+                        item = event.item
+                        item_type = item.type
+                        agent_name = getattr(
+                            getattr(item, "agent", None), "name", "Unknown"
+                        )
 
-                    if item_type == "tool_call_item":
-                        if hasattr(item, "raw_item"):
-                            tool_name = getattr(item.raw_item, "name", "Unknown Tool")
-                            tool_args = getattr(item.raw_item, "arguments", "")[:100]
-                            logger.info(
-                                f"🔧 [{agent_name}] "
-                                f"Tool call: {tool_name}({tool_args}...)"
-                            )
-                            execution_log.append(f"Tool call: {tool_name}")
+                        if item_type == "tool_call_item":
+                            if hasattr(item, "raw_item"):
+                                tool_name = getattr(
+                                    item.raw_item, "name", "Unknown Tool"
+                                )
+                                tool_args = getattr(item.raw_item, "arguments", "")[
+                                    :100
+                                ]
+                                logger.info(
+                                    f"🔧 [{agent_name}] "
+                                    f"Tool call: {tool_name}({tool_args}...)"
+                                )
+                                execution_log.append(f"Tool call: {tool_name}")
 
-                    elif item_type == "tool_call_output_item":
-                        if hasattr(item, "output"):
-                            output_preview = str(item.output)[:150]
-                            logger.info(
-                                f"📤 [{agent_name}] Tool output: {output_preview}..."
-                            )
-                            execution_log.append("Tool output received")
+                        elif item_type == "tool_call_output_item":
+                            if hasattr(item, "output"):
+                                output_preview = str(item.output)[:150]
+                                logger.info(
+                                    f"📤 [{agent_name}] "
+                                    f"Tool output: {output_preview}..."
+                                )
+                                execution_log.append("Tool output received")
 
-                    elif item_type == "message_output_item":
-                        if hasattr(item, "content") and item.content:
-                            for content_item in item.content:
-                                if getattr(content_item, "type", None) == "text":
-                                    text_preview = getattr(content_item, "text", "")[
-                                        :100
-                                    ]
-                                    if text_preview.strip():
-                                        logger.info(
-                                            f"💬 [{agent_name}] "
-                                            f"Output: {text_preview}..."
-                                        )
+                        elif item_type == "message_output_item":
+                            if hasattr(item, "content") and item.content:
+                                for content_item in item.content:
+                                    if getattr(content_item, "type", None) == "text":
+                                        text_preview = getattr(
+                                            content_item, "text", ""
+                                        )[:100]
+                                        if text_preview.strip():
+                                            logger.info(
+                                                f"💬 [{agent_name}] "
+                                                f"Output: {text_preview}..."
+                                            )
 
-                    elif item_type == "reasoning_item":
-                        if hasattr(item, "summary"):
-                            for summary_item in item.summary:
-                                if (
-                                    getattr(summary_item, "type", None)
-                                    == "summary_text"
-                                ):
-                                    reasoning_text = getattr(summary_item, "text", "")[
-                                        :100
-                                    ]
-                                    if reasoning_text.strip():
-                                        logger.info(
-                                            f"🧠 [{agent_name}] "
-                                            f"Reasoning: {reasoning_text}..."
-                                        )
+                        elif item_type == "reasoning_item":
+                            if hasattr(item, "summary"):
+                                for summary_item in item.summary:
+                                    if (
+                                        getattr(summary_item, "type", None)
+                                        == "summary_text"
+                                    ):
+                                        reasoning_text = getattr(
+                                            summary_item, "text", ""
+                                        )[:100]
+                                        if reasoning_text.strip():
+                                            logger.info(
+                                                f"🧠 [{agent_name}] "
+                                                f"Reasoning: {reasoning_text}..."
+                                            )
 
-                # Check raw response events (including token generation)
-                elif hasattr(event, "data") and hasattr(event.data, "type"):
-                    # Character counting is removed.
-                    pass
+                    # Check raw response events (including token generation)
+                    elif hasattr(event, "data") and hasattr(event.data, "type"):
+                        # Character counting is removed.
+                        pass
 
-            # Wait for streaming result to complete
-            await asyncio.wait_for(
-                result_streaming._run_impl_task, timeout=task_timeout
-            )
+                # Wait for streaming result to complete
+                await result_streaming._run_impl_task
             result = result_streaming
             logger.info("✅ Execution completed")
             execution_log.append("Streaming execution completed")
@@ -546,9 +578,17 @@ class AgentExecutor(Executor):
         }
 
     async def _run_agent_tasks_batch(
-        self, config_name: str, tasks: list[str], out_dir: Path
+        self,
+        config_name: str,
+        tasks: list[str],
+        out_dir: Path,
+        task_timeout: int,
     ) -> dict[str, Any]:
-        """Execute multiple agent tasks in batch"""
+        """Execute multiple agent tasks in batch under a shared agent build.
+
+        Each task runs under the same ``task_timeout`` as the single-task
+        path; failures are recorded per task without aborting the batch.
+        """
         from utu.agents import get_agent  # type: ignore # noqa: F401
         from utu.config import AgentConfig, ConfigLoader  # type: ignore # noqa: F401
         from utu.tracing.setup import setup_tracing  # type: ignore # noqa: F401
@@ -586,15 +626,21 @@ class AgentExecutor(Executor):
                     # Use streaming execution
                     result_streaming = agent.run_streamed(input=task_input)
 
-                    # Process stream events (simplified for batch)
-                    async for event in result_streaming.stream_events():
-                        # Log major events only to avoid overwhelming logs
-                        if hasattr(event, "new_agent") and event.new_agent:
-                            agent_name = getattr(event.new_agent, "name", "Unknown")
-                            logger.debug(f"Task {i+1}: Agent switched to {agent_name}")
+                    # ``asyncio.timeout`` covers both the event loop and the
+                    # impl-task wait so a stall before any event is still
+                    # bounded by ``task_timeout``.
+                    async with asyncio.timeout(task_timeout):
+                        # Process stream events (simplified for batch)
+                        async for event in result_streaming.stream_events():
+                            # Log major events only to avoid overwhelming logs
+                            if hasattr(event, "new_agent") and event.new_agent:
+                                agent_name = getattr(event.new_agent, "name", "Unknown")
+                                logger.debug(
+                                    f"Task {i+1}: Agent switched to {agent_name}"
+                                )
 
-                    # Wait for completion
-                    await asyncio.wait_for(result_streaming._run_impl_task, timeout=300)
+                        # Wait for completion (still under timeout).
+                        await result_streaming._run_impl_task
                     result = result_streaming
 
                     # Extract output

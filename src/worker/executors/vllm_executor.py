@@ -334,7 +334,6 @@ Summary:"""
             "kv_cache_dtype": str,
             "enforce_eager": bool,
             "hf_token": str,
-            "revision": str,
             "tokenizer_revision": str,
             "cpu_offload_gb": float,
             "swap_space": float,
@@ -349,6 +348,8 @@ Summary:"""
         for arg, arg_type in accepted_engine_args.items():
             if arg in vllm_cfg:
                 kwargs_base[arg] = arg_type(vllm_cfg.pop(arg))
+        if spec.model_revision:
+            kwargs_base["revision"] = spec.model_revision
         hf_overrides: dict[str, Any] = {}
         if "rope_scaling" in vllm_cfg:
             hf_overrides["rope_scaling"] = vllm_cfg.pop("rope_scaling")

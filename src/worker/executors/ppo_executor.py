@@ -14,7 +14,10 @@ import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from deepspeed.runtime.engine import DeepSpeedEngine
 
 import torch
 from datasets import Dataset
@@ -319,6 +322,27 @@ class _RewardAdapter(torch.nn.Module):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(self.__dict__.get("_lm", object()), name)
+
+
+def _resolve_report_to(value: Any) -> str | list[str]:
+    """Translate ``training.report_to`` into the value PPOConfig expects.
+
+    ``None`` (YAML ``null``) and empty strings/lists disable integrations
+    via TRL's ``"none"`` sentinel; strings and lists pass through.
+    """
+    if value is None:
+        return "none"
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else "none"
+    if isinstance(value, list):
+        cleaned = [
+            item.strip() for item in value if isinstance(item, str) and item.strip()
+        ]
+        return cleaned if cleaned else "none"
+    raise ExecutionError(
+        f"training.report_to must be null, str, or list[str]; got {value!r}"
+    )
 
 
 class PPOExecutor(TrainingMixin, Executor):
@@ -1055,6 +1079,9 @@ class PPOExecutor(TrainingMixin, Executor):
             training_config.get("num_train_epochs"), default=1.0, minimum=1.0
         )
         kl_coef = safe_float(training_config.get("kl_coef"), minimum=0)
+        # TODO: wire training.target_kl and training.early_stopping
+        # into a FlowMesh-owned early-stop hook. The templates still set these
+        # fields so the spec doesn't churn between PRs.
 
         max_seq_length = safe_int(
             training_config.get("max_seq_length"), default=64, minimum=1
@@ -1112,6 +1139,14 @@ class PPOExecutor(TrainingMixin, Executor):
             ppo_ctor_kwargs["save_total_limit"] = save_total_limit
         if save_only_model is not None:
             ppo_ctor_kwargs["save_only_model"] = bool(save_only_model)
+
+        if "report_to" in training_config:
+            ppo_ctor_kwargs["report_to"] = _resolve_report_to(
+                training_config["report_to"]
+            )
+        project = training_config.get("project")
+        if isinstance(project, str) and project:
+            ppo_ctor_kwargs["project"] = project
 
         ppo_config = PPOConfig(
             learning_rate=learning_rate,
@@ -1351,16 +1386,17 @@ class PPOExecutor(TrainingMixin, Executor):
             output_dir: str | None = None, _internal_call: bool = False
         ) -> None:
             backup_model = ppo_trainer.model
-            backup_deepspeed = ppo_trainer.deepspeed
+            backup_deepspeed: DeepSpeedEngine | None = None
             ppo_trainer.model = self._resolve_model_for_save(backup_model)
             if ppo_trainer.is_deepspeed_enabled:
+                backup_deepspeed = ppo_trainer.deepspeed
                 ppo_trainer.deepspeed = ppo_trainer.model  # type: ignore[assignment]
             try:
                 Trainer.save_model(ppo_trainer, output_dir, _internal_call)
             finally:
                 ppo_trainer.model = backup_model
                 if ppo_trainer.is_deepspeed_enabled:
-                    ppo_trainer.deepspeed = backup_deepspeed
+                    ppo_trainer.deepspeed = backup_deepspeed  # type: ignore[assignment]
 
         def _wrapped_save_checkpoint(model: Any, trial: Any) -> None:
             Trainer._save_checkpoint(ppo_trainer, model, trial)

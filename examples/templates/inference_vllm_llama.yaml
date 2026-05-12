@@ -4,43 +4,38 @@ metadata:
   name: inference-vllm-llama
   owner: alice
   annotations:
-    description: "Run text-generation inference using vLLM (TinyLlama-1.1B-Chat model from Hugging Face) on the GSM8K dataset."
+    description: Run text-generation inference using vLLM (TinyLlama-1.1B-Chat model from Hugging Face) on the GSM8K dataset.
 
 spec:
-  taskType: "inference"
-  sloSeconds: 10
-  parallel:
-    enabled: true           # false or remove to disable data-parallel
-    max_shards: 8           # optional cap; scheduler also considers capacity/ratio
+  taskType: inference
 
   # Resource requirements used by the orchestrator scheduler
   resources:
-    replicas: 1
     hardware:
-      cpu: "8"
-      memory: "32Gi"
+      cpu: 8
+      memory: 32Gi
       gpu:
-        type: "any"         # or a specific model, e.g. "nvidia-a100-80gb"
+        type: any         # or a specific model, e.g. "nvidia-a100-80gb"
         count: 1
 
   # Model configuration and vLLM runtime options
   model:
     source:
-      type: "huggingface"
-      identifier: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-      revision: "main"
+      type: huggingface
+      identifier: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+      revision: main
     vllm:
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.9
       trust_remote_code: true
 
-  # Data resource (this split will be evenly partitioned across shards when parallel.enabled=true)
+  # Data resource
   data:
-    type: "dataset"
-    url: "openai/gsm8k"
-    name: "main"
-    split: "train[:1%]"     # scheduler will produce per-shard sub-splits like train[0%:0.5%], train[0.5%:1%], ...
-    column: "question"
+    type: dataset
+    url: openai/gsm8k
+    name: main
+    split: "train[:1%]"
+    column: question
     shuffle: true
     seed: 42
 
@@ -53,7 +48,7 @@ spec:
   # Output configuration (current worker writes locally to RESULTS_DIR/<task_id>/results.json)
   output:
     destination:
-      type: "local"
+      type: local
     artifacts:
-      - "results.json"
-      - "logs"
+      - results.json
+      - logs
