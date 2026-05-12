@@ -19,7 +19,7 @@ from flowmesh_stack.docker import (
     remove_image,
 )
 from flowmesh_stack.doctor import DoctorFinding, run_doctor_checks
-from flowmesh_stack.env import ensure_env_file, load_env
+from flowmesh_stack.env import ensure_env_file, load_env, parse_env_file
 from flowmesh_stack.env_schema import render_env_example
 from flowmesh_stack.images import (
     BUILD_GROUPS,
@@ -65,12 +65,23 @@ def _stack() -> DockerComposeStack:
 
 
 def _compose(
-    args: list[str], env_file: Path, env: dict[str, str] | None, to_deploy: bool = False
+    args: list[str],
+    env_file: Path,
+    env: dict[str, str] | None,
+    to_deploy: bool = False,
+    profile: str | None = None,
 ) -> None:
     ensure_env_file(env_file, stack_env_example())
-    result = _stack().run(args, env_file=env_file, env=env, to_deploy=to_deploy)
+    full_args = (["--profile", profile] if profile else []) + args
+    result = _stack().run(full_args, env_file=env_file, env=env, to_deploy=to_deploy)
     if result.returncode != 0:
         raise typer.Exit(code=result.returncode)
+
+
+def _node_role(env_file: Path) -> str:
+    """Return the configured NODE_ROLE (root | worker), defaulting to root."""
+    role = parse_env_file(env_file).get("NODE_ROLE", "root").strip().lower()
+    return role if role in ("root", "worker") else "root"
 
 
 def _resolve_build_targets(batch_targets: list[str]) -> list[str]:
@@ -400,7 +411,10 @@ def pull(
 ) -> None:
     """Pull Docker images for stack services from the registry."""
     args = ["pull"] + (services or [])
-    _compose(args, env_file=env_file, env=image_env_overrides(image_tag))
+    profile = "root" if _node_role(env_file) == "root" else None
+    _compose(
+        args, env_file=env_file, env=image_env_overrides(image_tag), profile=profile
+    )
 
 
 @app.command()
@@ -427,12 +441,20 @@ def up(
         None, "--image-tag", help="Override FLOWMESH_VERSION"
     ),
 ) -> None:
-    """Start the stack including server and Redis."""
+    """Start the stack.
+
+    On root nodes (NODE_ROLE=root, the default), the local Redis services are
+    started alongside the server. On worker nodes (NODE_ROLE=worker), Redis
+    services are skipped — the worker is expected to connect to the root
+    node's Redis via REDIS_CONTROL_URL / REDIS_TELEMETRY_URL.
+    """
+    profile = "root" if _node_role(env_file) == "root" else None
     _compose(
         ["up", "-d", "--wait"],
         env_file=env_file,
         env=image_env_overrides(image_tag),
         to_deploy=True,
+        profile=profile,
     )
     logging.success("FlowMesh stack is up.")
 
@@ -459,7 +481,12 @@ def down(
     logging.info("Draining workers...")
     _drain_workers(env_file)
     logging.info("Shutting down the FlowMesh stack...")
-    _compose(["down"], env_file=env_file, env=image_env_overrides(image_tag))
+    _compose(
+        ["down"],
+        env_file=env_file,
+        env=image_env_overrides(image_tag),
+        profile="root",
+    )
     logging.success("FlowMesh stack stopped.")
 
 
@@ -475,12 +502,19 @@ def restart(
     """Drain workers and restart the stack."""
     logging.info("Draining workers...")
     _drain_workers(env_file)
-    _compose(["down"], env_file=env_file, env=image_env_overrides(image_tag))
+    _compose(
+        ["down"],
+        env_file=env_file,
+        env=image_env_overrides(image_tag),
+        profile="root",
+    )
+    profile = "root" if _node_role(env_file) == "root" else None
     _compose(
         ["up", "-d", "--wait"],
         env_file=env_file,
         env=image_env_overrides(image_tag),
         to_deploy=True,
+        profile=profile,
     )
     logging.success("FlowMesh stack is up.")
 
@@ -493,7 +527,7 @@ def logs(
     ),
 ) -> None:
     """Stream logs from stack services or a specific service container."""
-    code = _stack().stream_logs(env_file=env_file, service=service)
+    code = _stack().stream_logs(env_file=env_file, service=service, profile="root")
     if code != 0:
         raise typer.Exit(code=code)
 
@@ -505,7 +539,7 @@ def ps(
     ),
 ) -> None:
     """Display running status of stack containers and worker containers."""
-    _compose(["ps"], env_file=env_file, env=None)
+    _compose(["ps"], env_file=env_file, env=None, profile="root")
     logging.log("\nWorkers:")
     docker_bin = _require_bin("docker")
     subprocess.run(
@@ -545,7 +579,12 @@ def clean(
     logging.info("Draining workers...")
     _drain_workers(env_file)
     logging.info("Removing stack containers and volumes...")
-    _compose(["down", "-v"], env_file=env_file, env=image_env_overrides(image_tag))
+    _compose(
+        ["down", "-v"],
+        env_file=env_file,
+        env=image_env_overrides(image_tag),
+        profile="root",
+    )
     logging.success("FlowMesh stack cleaned.")
 
 
