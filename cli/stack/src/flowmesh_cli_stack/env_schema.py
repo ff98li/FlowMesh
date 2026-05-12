@@ -1,5 +1,6 @@
 """Stack env schema."""
 
+from flowmesh.models.nodes import NodeRole
 from flowmesh_stack.env_schema import (
     EnvSchema,
     EnvSection,
@@ -46,9 +47,9 @@ STACK_ENV_SCHEMA = EnvSchema(
                 ),
                 EnvVar(
                     "NODE_ROLE",
-                    "root",
+                    NodeRole.ROOT.value,
                     var_type=EnvVarType.ENUM,
-                    choices={"root", "worker"},
+                    choices=NodeRole,
                 ),
                 EnvVar("NODE_NAMESPACE", "flowmesh"),
                 EnvVar("NODE_CLUSTER", "dev"),
@@ -622,3 +623,24 @@ STACK_ENV_SCHEMA = EnvSchema(
         ),
     ],
 )
+
+
+# Schema-default overrides applied when rendering a worker-role .env.
+# Unused vars are blanked out to avoid confusion and misconfiguration.
+WORKER_ROLE_OVERRIDES = {
+    "NODE_ROLE": NodeRole.WORKER.value,
+    "REDIS_TLS_CERT_FILE": "",
+    "REDIS_TLS_KEY_FILE": "",
+}
+
+
+def role_overrides(role: NodeRole) -> dict[str, str]:
+    """Return the schema-default overrides for a given role's rendered .env."""
+    return WORKER_ROLE_OVERRIDES.copy() if role == NodeRole.WORKER else {}
+
+
+def deploy_overrides(deploy: bool, version: str | None = None) -> dict[str, str]:
+    """Return the schema-default overrides for a deploy-shaped rendered .env."""
+    if not (deploy and version):
+        return {}
+    return {"FLOWMESH_VERSION": version}

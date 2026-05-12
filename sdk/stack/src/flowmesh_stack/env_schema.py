@@ -1,7 +1,7 @@
 """Environment schema definitions and pure validation helpers."""
 
 import enum
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from logging import _nameToLevel as LOG_LEVELS
 from pathlib import Path
@@ -32,7 +32,7 @@ class EnvVar:
     var_type: EnvVarType = EnvVarType.STRING
     required: bool = False
     use_default: bool = False
-    choices: set[str] | None = None
+    choices: Iterable[str] | None = None
     min_value: float | None = None
     max_value: float | None = None
     min_length: int | None = None
@@ -68,8 +68,16 @@ def schema_keys(schema: EnvSchema) -> set[str]:
     return keys
 
 
-def render_env_example(schema: EnvSchema) -> str:
-    """Render an example .env file based on the schema."""
+def render_env_example(
+    schema: EnvSchema, overrides: Mapping[str, str] | None = None
+) -> str:
+    """Render an example .env file based on the schema.
+
+    ``overrides`` swaps in a different default value for the listed keys to produce a
+    worker-shaped env without rebuilding the schema). Keys not present in ``overrides``
+    use their schema-declared default.
+    """
+    overrides = overrides or {}
     lines: list[str] = []
     lines.extend(schema.header)
     for section in schema.sections:
@@ -84,7 +92,8 @@ def render_env_example(schema: EnvSchema) -> str:
                         lines.append(f"# {desc_line}")
                 else:
                     lines.append(f"# {description}")
-            lines.append(f"{var.key}={var.default}")
+            value = overrides.get(var.key, var.default)
+            lines.append(f"{var.key}={value}")
     lines.append("")
     return "\n".join(lines)
 

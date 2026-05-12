@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
+from flowmesh.models.nodes import NodeRole
 from flowmesh_cli.core import logging
 from flowmesh_cli.core.assets import AssetNotFoundError, asset_path
 from flowmesh_cli.core.typer import get_typer
@@ -30,12 +31,14 @@ from flowmesh_stack.images import (
     get_push_platforms,
 )
 
-from .env_schema import STACK_ENV_SCHEMA
+from .env_schema import STACK_ENV_SCHEMA, deploy_overrides, role_overrides
 from .utils import (
     DEFAULT_ENV_FILE,
     STACK_PATH_KEYS,
     apply_stack_resource_env,
     ensure_deploy_paths,
+    parse_node_role,
+    resolve_package_version,
     stack_bake_file,
     stack_compose_file,
     stack_env_example,
@@ -78,18 +81,16 @@ def _compose(
         raise typer.Exit(code=result.returncode)
 
 
-def _node_role(env_file: Path) -> str:
+def _node_role(env_file: Path) -> NodeRole:
     """Return the configured NODE_ROLE (root | worker), defaulting to root if unset."""
     raw = parse_env_file(env_file).get("NODE_ROLE", "").strip()
-    if not raw:
-        return "root"
-    role = raw.lower()
-    if role not in ("root", "worker"):
+    try:
+        return NodeRole(raw.lower()) if raw else NodeRole.ROOT
+    except ValueError:
         logging.error(
             f"NODE_ROLE={raw!r} is not a recognized role; expected 'root' or 'worker'."
         )
         raise typer.Exit(code=1)
-    return role
 
 
 def _resolve_build_targets(batch_targets: list[str]) -> list[str]:
@@ -449,7 +450,7 @@ def pull(
 ) -> None:
     """Pull Docker images for stack services from the registry."""
     args = ["pull"] + (services or [])
-    profile = "root" if _node_role(env_file) == "root" else None
+    profile = "root" if _node_role(env_file) == NodeRole.ROOT else None
     _compose(
         args, env_file=env_file, env=image_env_overrides(image_tag), profile=profile
     )
@@ -486,7 +487,7 @@ def up(
     services are skipped — the worker is expected to connect to the root
     node's Redis via REDIS_CONTROL_URL / REDIS_TELEMETRY_URL.
     """
-    profile = "root" if _node_role(env_file) == "root" else None
+    profile = "root" if _node_role(env_file) == NodeRole.ROOT else None
     _compose(
         ["up", "-d", "--wait"],
         env_file=env_file,
@@ -546,7 +547,7 @@ def restart(
         env=image_env_overrides(image_tag),
         profile="root",
     )
-    profile = "root" if _node_role(env_file) == "root" else None
+    profile = "root" if _node_role(env_file) == NodeRole.ROOT else None
     _compose(
         ["up", "-d", "--wait"],
         env_file=env_file,
@@ -674,18 +675,45 @@ def init(
     force: bool = typer.Option(
         False, "--force", "-f", help="Force initialization; overwrite existing files"
     ),
+    role: str = typer.Option(
+        NodeRole.ROOT.value,
+        "--role",
+        help="Target NODE_ROLE for the generated env file (root|worker).",
+    ),
+    deploy: bool = typer.Option(
+        False,
+        "--deploy",
+        help=(
+            "Pin FLOWMESH_VERSION to the installed flowmesh-cli-stack package version"
+            "(falls back to 'latest' if package metadata is missing)."
+        ),
+    ),
 ) -> None:
-    """Create or overwrite the stack env file from the example template."""
-    example = stack_env_example()
-    if not example.exists():
-        logging.error(f"Env example not found: {example}")
-        raise typer.Exit(code=1)
+    """Create or overwrite the stack env file rendered from the schema."""
+    node_role = parse_node_role(role)
     if env_file.exists() and not force:
         if not typer.confirm(f"{env_file} exists. Overwrite?", default=False):
             logging.info("Keeping existing env file.")
             return
-    env_file.write_text(example.read_text())
-    logging.success(f"Wrote {env_file} from {example.name}.")
+    deploy_version: str | None = None
+    if deploy:
+        package_version = resolve_package_version()
+        if package_version is None:
+            logging.warning(
+                "Unable to resolve flowmesh-cli-stack version; "
+                "falling back to FLOWMESH_VERSION=latest. "
+                "Edit .env if you need a specific version."
+            )
+            deploy_version = "latest"
+        else:
+            # GHCR images for releases are pushed at v<version>.
+            deploy_version = f"v{package_version}"
+    overrides = {
+        **role_overrides(node_role),
+        **deploy_overrides(deploy, deploy_version),
+    }
+    env_file.write_text(render_env_example(STACK_ENV_SCHEMA, overrides=overrides))
+    logging.success(f"Wrote {env_file} (NODE_ROLE={node_role.value}).")
 
 
 @app.command("purge")
