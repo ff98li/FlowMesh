@@ -15,6 +15,8 @@ PACKAGE_PYPROJECTS: tuple[Path, ...] = (
     REPO_ROOT / "sdk" / "pyproject.toml",
     REPO_ROOT / "sdk" / "stack" / "pyproject.toml",
 )
+SDK_VERSION_MODULE = REPO_ROOT / "sdk" / "src" / "flowmesh" / "_version.py"
+SHARED_VERSION_MODULE = REPO_ROOT / "src" / "shared" / "_version.py"
 FIRST_PARTY_DISTRIBUTIONS: tuple[str, ...] = (
     "flowmesh-cli-stack",
     "flowmesh-sdk-stack",
@@ -25,6 +27,8 @@ FIRST_PARTY_DISTRIBUTIONS: tuple[str, ...] = (
 )
 
 _VERSION_RE = re.compile(r'(?m)^version = "[^"]+"$')
+_SDK_STATIC_VERSION_RE = re.compile(r'(?m)^_STATIC_VERSION = "[^"]+"$')
+_SHARED_RUNTIME_VERSION_RE = re.compile(r'(?m)^FLOWMESH_RELEASE_VERSION = "[^"]+"$')
 _PIN_RE = re.compile(
     r"(?P<name>\b(?:"
     + "|".join(re.escape(name) for name in FIRST_PARTY_DISTRIBUTIONS)
@@ -50,6 +54,40 @@ def _render(text: str, version: str, path: Path) -> str:
     )
 
 
+def _render_literal_assignment(
+    text: str,
+    version: str,
+    path: Path,
+    pattern: re.Pattern[str],
+    name: str,
+) -> str:
+    if len(pattern.findall(text)) != 1:
+        rel = path.relative_to(REPO_ROOT)
+        raise SystemExit(f"Expected one {name} line in {rel}.")
+    rendered = pattern.sub(f'{name} = "{version}"', text, count=1)
+    return rendered
+
+
+def _render_sdk_version_module(text: str, version: str) -> str:
+    return _render_literal_assignment(
+        text,
+        version,
+        SDK_VERSION_MODULE,
+        _SDK_STATIC_VERSION_RE,
+        "_STATIC_VERSION",
+    )
+
+
+def _render_shared_version_module(text: str, version: str) -> str:
+    return _render_literal_assignment(
+        text,
+        version,
+        SHARED_VERSION_MODULE,
+        _SHARED_RUNTIME_VERSION_RE,
+        "FLOWMESH_RELEASE_VERSION",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("version", help="Synchronized release version, e.g. 0.1.1.")
@@ -65,6 +103,22 @@ def main() -> int:
     for path in PACKAGE_PYPROJECTS:
         current = path.read_text()
         rendered.append((path, current, _render(current, version, path)))
+    sdk_version_current = SDK_VERSION_MODULE.read_text()
+    rendered.append(
+        (
+            SDK_VERSION_MODULE,
+            sdk_version_current,
+            _render_sdk_version_module(sdk_version_current, version),
+        )
+    )
+    shared_version_current = SHARED_VERSION_MODULE.read_text()
+    rendered.append(
+        (
+            SHARED_VERSION_MODULE,
+            shared_version_current,
+            _render_shared_version_module(shared_version_current, version),
+        )
+    )
 
     changed = [path for path, current, updated in rendered if current != updated]
     if args.check:
