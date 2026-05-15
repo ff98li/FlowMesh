@@ -16,6 +16,8 @@ except Exception:
         Omni = None
     _HAS_OMNI = False
 
+from shared.schemas.governance import SpanType
+from shared.tasks.specs import TaskSpecStrictBase
 from shared.tasks.specs.omni import OmniText2SpeechSpecStrict
 from shared.utils.parsing import as_list, to_int
 
@@ -26,7 +28,7 @@ from .omni_executor_base import (
     extract_multimodal_output,
     save_audio,
 )
-from .utils.checkpoints import artifact_ref, maybe_upload_artifacts
+from .utils.checkpoints import artifact_ref
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,7 @@ class OmniText2SpeechExecutor(OmniExecutorBase):
     """Generate speech audio using vllm_omni.Omni."""
 
     name = "omni_text2speech"
+    _TASK_SPEC_TYPE = OmniText2SpeechSpecStrict
 
     def prepare(self) -> None:
         if not _HAS_OMNI:
@@ -42,44 +45,61 @@ class OmniText2SpeechExecutor(OmniExecutorBase):
                 "vllm_omni is not installed; cannot use omni_text2speech executor."
             )
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
-        spec = self.require_spec(task, OmniText2SpeechSpecStrict)
-        spec_dict = spec.model_dump(by_alias=True)
-        out_dir = Path(out_dir).resolve()
+    def _run_inner(
+        self,
+        task: ExecutorTask,
+        spec: TaskSpecStrictBase,
+        spec_dict: dict[str, Any],
+        out_dir: Path,
+    ) -> dict[str, Any]:
+        assert isinstance(spec, OmniText2SpeechSpecStrict)
+        texts = self._collect_text_inputs(spec, task.task_id)
 
-        texts = self.collect_text_inputs(spec_dict)
-        if not texts:
-            raise ExecutionError(
-                "omni_text2speech requires text input "
-                "in spec.data.text or spec.data.items."
-            )
-
-        self._ensure_omni(spec_dict)
+        with self._span(
+            "model load",
+            span_type=SpanType.COMPUTE,
+            attributes={"task_id": task.task_id, "prompt_count": len(texts)},
+        ):
+            self._ensure_omni(spec_dict)
         cfg = self.omni_cfg(spec_dict, "omni:tts", "omni_text2speech")
-        output_format = str(cfg.get("output_format") or "wav").strip().lower() or "wav"
+        output_format = str(cfg.get("output_format") or "").strip().lower() or "wav"
         sample_rate = to_int(cfg.get("sample_rate"), default=24000)
 
-        audio_objects = [self._generate_single(t, spec_dict=spec_dict) for t in texts]
+        with self._span(
+            "generation",
+            span_type=SpanType.COMPUTE,
+            attributes={"task_id": task.task_id, "prompt_count": len(texts)},
+        ):
+            audio_objects = [
+                self._generate_single(t, spec_dict=spec_dict) for t in texts
+            ]
         artifacts_dir = out_dir / "artifacts"
         items: list[dict[str, Any]] = []
-        for idx, (text, audio_obj) in enumerate(zip(texts, audio_objects)):
-            save_path = self.resolve_save_path(
-                cfg,
-                out_dir,
-                index=idx,
-                ext=output_format,
-                multi=len(texts) > 1,
-                default_prefix="generated_tts",
-            )
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            save_audio(audio_obj, save_path, sample_rate=sample_rate)
-            items.append(
-                {
-                    "index": idx,
-                    "text": text,
-                    "audio": artifact_ref(self.relative_to(save_path, artifacts_dir)),
-                }
-            )
+        with self._span(
+            "output postprocessing",
+            span_type=SpanType.COMPUTE,
+            attributes={"task_id": task.task_id, "item_count": len(texts)},
+        ):
+            for idx, (text, audio_obj) in enumerate(zip(texts, audio_objects)):
+                save_path = self.resolve_save_path(
+                    cfg,
+                    out_dir,
+                    index=idx,
+                    ext=output_format,
+                    multi=len(texts) > 1,
+                    default_prefix="generated_tts",
+                )
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_audio(audio_obj, save_path, sample_rate=sample_rate)
+                items.append(
+                    {
+                        "index": idx,
+                        "text": text,
+                        "audio": artifact_ref(
+                            self.relative_to(save_path, artifacts_dir)
+                        ),
+                    }
+                )
 
         first = items[0]["audio"] if items else {}
         result: dict[str, Any] = {
@@ -94,7 +114,6 @@ class OmniText2SpeechExecutor(OmniExecutorBase):
         storyboard = spec_dict.get("storyboard")
         if isinstance(storyboard, dict):
             result["storyboard"] = dict(storyboard)
-        maybe_upload_artifacts(task, out_dir, logger=logger)
         return result
 
     # ── model ────────────────────────────────────────────────────────────

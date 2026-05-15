@@ -26,12 +26,14 @@ except Exception:
         Omni = None
     _HAS_OMNI = False
 
+from shared.schemas.governance import SpanType
+from shared.tasks.specs import TaskSpecStrictBase
 from shared.tasks.specs.omni import OmniText2GeneralSpecStrict
 from shared.utils.parsing import as_list, to_bool, to_float, to_int, to_int_list
 
 from .base_executor import ExecutionError, ExecutorTask
 from .omni_executor_base import OmniExecutorBase, extract_audio_from_mm, save_audio
-from .utils.checkpoints import artifact_ref, maybe_upload_artifacts
+from .utils.checkpoints import artifact_ref
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,7 @@ class OmniText2GeneralExecutor(OmniExecutorBase):
     """Generate narration/speech audio using Qwen3-Omni through vllm_omni.Omni."""
 
     name = "omni_text2general"
+    _TASK_SPEC_TYPE = OmniText2GeneralSpecStrict
 
     def prepare(self) -> None:
         if not _HAS_OMNI:
@@ -58,20 +61,18 @@ class OmniText2GeneralExecutor(OmniExecutorBase):
                 "omni_text2general requires SamplingParams from vllm."
             )
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
-        spec = self.require_spec(task, OmniText2GeneralSpecStrict)
-        spec_dict = spec.model_dump(by_alias=True)
-        out_dir = Path(out_dir).resolve()
-
-        texts = self.collect_text_inputs(spec_dict)
-        if not texts:
-            raise ExecutionError(
-                "omni_text2general requires text input "
-                "in spec.data.text or spec.data.items."
-            )
+    def _run_inner(
+        self,
+        task: ExecutorTask,
+        spec: TaskSpecStrictBase,
+        spec_dict: dict[str, Any],
+        out_dir: Path,
+    ) -> dict[str, Any]:
+        assert isinstance(spec, OmniText2GeneralSpecStrict)
+        texts = self._collect_text_inputs(spec, task.task_id)
 
         cfg = _narration_cfg(spec_dict)
-        output_format = str(cfg.get("output_format") or "wav").strip().lower() or "wav"
+        output_format = str(cfg.get("output_format") or "").strip().lower() or "wav"
         if output_format != "wav":
             raise ExecutionError(
                 "omni_text2general currently supports output_format='wav' only."
@@ -80,7 +81,12 @@ class OmniText2GeneralExecutor(OmniExecutorBase):
         output_modalities = _parse_modalities(cfg.get("modalities"))
         py_generator = to_bool(cfg.get("py_generator"), default=False)
 
-        self._ensure_omni(spec_dict)
+        with self._span(
+            "model load",
+            span_type=SpanType.COMPUTE,
+            attributes={"task_id": task.task_id, "prompt_count": len(texts)},
+        ):
+            self._ensure_omni(spec_dict)
         if self._omni is None:
             raise ExecutionError("Omni model failed to initialize.")
 
@@ -93,37 +99,46 @@ class OmniText2GeneralExecutor(OmniExecutorBase):
         ]
         sampling_params = _build_sampling_params(cfg)
 
-        try:
-            generator = self._omni.generate(
-                prompts, sampling_params, py_generator=py_generator
-            )
-        except Exception as exc:
-            raise ExecutionError(
-                f"omni_text2general generation failed to start: {exc}"
-            ) from exc
-
         audio_results: list[dict[str, Any]] = []
         text_results: dict[str, str] = {}
-        for stage_outputs in generator:
-            final_type = (
-                str(getattr(stage_outputs, "final_output_type", "")).strip().lower()
-            )
-            request_outputs = as_list(getattr(stage_outputs, "request_output", None))
-            if not request_outputs:
-                continue
-            if final_type == "text":
-                for req in request_outputs:
-                    rid = _request_id(req, default_index=len(text_results) + 1)
-                    text_out = _extract_text_output(req)
-                    if text_out is not None:
-                        text_results[rid] = text_out
-                continue
-            if final_type == "audio":
-                for req in request_outputs:
-                    rid = _request_id(req, default_index=len(audio_results) + 1)
-                    audio_obj = _extract_request_audio(req)
-                    if audio_obj is not None:
-                        audio_results.append({"request_id": rid, "audio": audio_obj})
+        with self._span(
+            "generation",
+            span_type=SpanType.COMPUTE,
+            attributes={"task_id": task.task_id, "prompt_count": len(prompts)},
+        ):
+            try:
+                generator = self._omni.generate(
+                    prompts, sampling_params, py_generator=py_generator
+                )
+            except Exception as exc:
+                raise ExecutionError(
+                    f"omni_text2general generation failed to start: {exc}"
+                ) from exc
+
+            for stage_outputs in generator:
+                final_type = (
+                    str(getattr(stage_outputs, "final_output_type", "")).strip().lower()
+                )
+                request_outputs = as_list(
+                    getattr(stage_outputs, "request_output", None)
+                )
+                if not request_outputs:
+                    continue
+                if final_type == "text":
+                    for req in request_outputs:
+                        rid = _request_id(req, default_index=len(text_results) + 1)
+                        text_out = _extract_text_output(req)
+                        if text_out is not None:
+                            text_results[rid] = text_out
+                    continue
+                if final_type == "audio":
+                    for req in request_outputs:
+                        rid = _request_id(req, default_index=len(audio_results) + 1)
+                        audio_obj = _extract_request_audio(req)
+                        if audio_obj is not None:
+                            audio_results.append(
+                                {"request_id": rid, "audio": audio_obj}
+                            )
 
         if not audio_results:
             raise ExecutionError(
@@ -133,29 +148,34 @@ class OmniText2GeneralExecutor(OmniExecutorBase):
         artifacts_dir = out_dir / "artifacts"
         items: list[dict[str, Any]] = []
         multi = len(audio_results) > 1
-        for idx, entry in enumerate(audio_results):
-            rid = str(entry.get("request_id") or f"req_{idx + 1}")
-            audio_obj = entry.get("audio")
-            save_path = self.resolve_save_path(
-                cfg,
-                out_dir,
-                index=idx,
-                ext=output_format,
-                multi=multi,
-                default_prefix="narration",
-            )
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            save_audio(audio_obj, save_path, sample_rate=sample_rate)
-            item: dict[str, Any] = {
-                "index": idx,
-                "request_id": rid,
-                "prompt": texts[idx] if idx < len(texts) else None,
-                "audio": artifact_ref(self.relative_to(save_path, artifacts_dir)),
-            }
-            text_out = text_results.get(rid)
-            if text_out:
-                item["text"] = text_out
-            items.append(item)
+        with self._span(
+            "output postprocessing",
+            span_type=SpanType.COMPUTE,
+            attributes={"task_id": task.task_id, "item_count": len(audio_results)},
+        ):
+            for idx, entry in enumerate(audio_results):
+                rid = str(entry.get("request_id") or f"req_{idx + 1}")
+                audio_obj = entry.get("audio")
+                save_path = self.resolve_save_path(
+                    cfg,
+                    out_dir,
+                    index=idx,
+                    ext=output_format,
+                    multi=multi,
+                    default_prefix="narration",
+                )
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_audio(audio_obj, save_path, sample_rate=sample_rate)
+                item: dict[str, Any] = {
+                    "index": idx,
+                    "request_id": rid,
+                    "prompt": texts[idx] if idx < len(texts) else None,
+                    "audio": artifact_ref(self.relative_to(save_path, artifacts_dir)),
+                }
+                text_out = text_results.get(rid)
+                if text_out:
+                    item["text"] = text_out
+                items.append(item)
 
         first = items[0]["audio"] if items else {}
         result: dict[str, Any] = {
@@ -170,7 +190,6 @@ class OmniText2GeneralExecutor(OmniExecutorBase):
         storyboard = spec_dict.get("storyboard")
         if isinstance(storyboard, dict):
             result["storyboard"] = dict(storyboard)
-        maybe_upload_artifacts(task, out_dir, logger=logger)
         return result
 
     # ── model ────────────────────────────────────────────────────────────

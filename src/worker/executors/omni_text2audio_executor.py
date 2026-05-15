@@ -50,12 +50,14 @@ except Exception:
         current_omni_platform = None
     _HAS_OMNI_PLATFORM = False
 
+from shared.schemas.governance import SpanType
+from shared.tasks.specs import TaskSpecStrictBase
 from shared.tasks.specs.omni import OmniText2AudioSpecStrict
 from shared.utils.parsing import to_float, to_int
 
 from .base_executor import ExecutionError, ExecutorTask
 from .omni_executor_base import OmniExecutorBase, extract_multimodal_output
-from .utils.checkpoints import artifact_ref, maybe_upload_artifacts
+from .utils.checkpoints import artifact_ref
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,7 @@ class OmniText2AudioExecutor(OmniExecutorBase):
     """Generate background music with Omni diffusion sampling."""
 
     name = "omni_text2audio"
+    _TASK_SPEC_TYPE = OmniText2AudioSpecStrict
 
     def prepare(self) -> None:
         if torch is None:
@@ -75,20 +78,18 @@ class OmniText2AudioExecutor(OmniExecutorBase):
                 "vllm_omni is not installed; cannot use omni_text2audio executor."
             )
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
-        spec = self.require_spec(task, OmniText2AudioSpecStrict)
-        spec_dict = spec.model_dump(by_alias=True)
-        out_dir = Path(out_dir).resolve()
-
-        prompts = self.collect_text_inputs(spec_dict)
-        if not prompts:
-            raise ExecutionError(
-                "omni_text2audio requires prompt text "
-                "in spec.data.text or spec.data.items."
-            )
+    def _run_inner(
+        self,
+        task: ExecutorTask,
+        spec: TaskSpecStrictBase,
+        spec_dict: dict[str, Any],
+        out_dir: Path,
+    ) -> dict[str, Any]:
+        assert isinstance(spec, OmniText2AudioSpecStrict)
+        prompts = self._collect_text_inputs(spec, task.task_id)
 
         cfg = _bgm_cfg(spec_dict)
-        output_format = str(cfg.get("output_format") or "wav").strip().lower() or "wav"
+        output_format = str(cfg.get("output_format") or "").strip().lower() or "wav"
         if output_format != "wav":
             raise ExecutionError(
                 "omni_text2audio currently supports output_format='wav' only."
@@ -106,75 +107,97 @@ class OmniText2AudioExecutor(OmniExecutorBase):
         base_seed = to_int(cfg.get("seed"), default=42)
         negative_prompt = str(cfg.get("negative_prompt") or "Low quality.").strip()
 
-        self._ensure_omni(spec_dict)
+        with self._span(
+            "model load",
+            span_type=SpanType.COMPUTE,
+            attributes={"task_id": task.task_id, "prompt_count": len(prompts)},
+        ):
+            self._ensure_omni(spec_dict)
         omni = self._omni
         if omni is None:
             raise ExecutionError("Omni BGM model failed to initialize.")
 
         generator_device = _resolve_generator_device()
         per_prompt_outputs: list[tuple[int, str, Any]] = []
-        for prompt_idx, prompt in enumerate(prompts):
-            seed = base_seed + prompt_idx
-            torch_generator = torch.Generator(device=generator_device).manual_seed(seed)
+        with self._span(
+            "generation",
+            span_type=SpanType.COMPUTE,
+            attributes={
+                "task_id": task.task_id,
+                "prompt_count": len(prompts),
+                "num_waveforms": num_waveforms,
+                "num_inference_steps": num_inference_steps,
+            },
+        ):
+            for prompt_idx, prompt in enumerate(prompts):
+                seed = base_seed + prompt_idx
+                torch_generator = torch.Generator(device=generator_device).manual_seed(
+                    seed
+                )
 
-            omni_prompt: OmniTextPrompt = {"prompt": prompt}
-            if negative_prompt:
-                omni_prompt["negative_prompt"] = negative_prompt
+                omni_prompt: OmniTextPrompt = {"prompt": prompt}
+                if negative_prompt:
+                    omni_prompt["negative_prompt"] = negative_prompt
 
-            sampling = OmniDiffusionSamplingParams(
-                generator=torch_generator,
-                generator_device=generator_device,
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_inference_steps,
-                num_outputs_per_prompt=num_waveforms,
-                extra_args={
-                    "audio_start_in_s": audio_start,
-                    "audio_end_in_s": audio_end,
-                },
-            )
-            try:
-                outputs = omni.generate(omni_prompt, sampling)
-            except Exception as exc:
-                raise ExecutionError(
-                    f"omni_text2audio generation failed: {exc}"
-                ) from exc
-            per_prompt_outputs.append((prompt_idx, prompt, outputs))
+                sampling = OmniDiffusionSamplingParams(
+                    generator=torch_generator,
+                    generator_device=generator_device,
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_inference_steps,
+                    num_outputs_per_prompt=num_waveforms,
+                    extra_args={
+                        "audio_start_in_s": audio_start,
+                        "audio_end_in_s": audio_end,
+                    },
+                )
+                try:
+                    outputs = omni.generate(omni_prompt, sampling)
+                except Exception as exc:
+                    raise ExecutionError(
+                        f"omni_text2audio generation failed: {exc}"
+                    ) from exc
+                per_prompt_outputs.append((prompt_idx, prompt, outputs))
 
         artifacts_dir = out_dir / "artifacts"
         items: list[dict[str, Any]] = []
         global_index = 0
-        for prompt_idx, prompt, outputs in per_prompt_outputs:
-            extracted = _extract_audio_waveforms(outputs)
-            if not extracted:
-                raise ExecutionError(
-                    "omni_text2audio completed but returned no audio output."
-                )
+        with self._span(
+            "output postprocessing",
+            span_type=SpanType.COMPUTE,
+            attributes={"task_id": task.task_id, "prompt_count": len(prompts)},
+        ):
+            for prompt_idx, prompt, outputs in per_prompt_outputs:
+                extracted = _extract_audio_waveforms(outputs)
+                if not extracted:
+                    raise ExecutionError(
+                        "omni_text2audio completed but returned no audio output."
+                    )
 
-            for local_idx, audio_entry in enumerate(extracted):
-                multi = len(prompts) * len(extracted) > 1
-                save_path = _resolve_bgm_save_path(
-                    cfg,
-                    out_dir,
-                    index=global_index,
-                    ext=output_format,
-                    multi=multi,
-                )
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-                _save_waveform(
-                    audio_entry["waveform"], save_path, sample_rate=sample_rate
-                )
-                items.append(
-                    {
-                        "index": global_index,
-                        "prompt_index": prompt_idx,
-                        "waveform_index": local_idx,
-                        "prompt": prompt,
-                        "audio": artifact_ref(
-                            self.relative_to(save_path, artifacts_dir)
-                        ),
-                    }
-                )
-                global_index += 1
+                for local_idx, audio_entry in enumerate(extracted):
+                    multi = len(prompts) * len(extracted) > 1
+                    save_path = _resolve_bgm_save_path(
+                        cfg,
+                        out_dir,
+                        index=global_index,
+                        ext=output_format,
+                        multi=multi,
+                    )
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    _save_waveform(
+                        audio_entry["waveform"], save_path, sample_rate=sample_rate
+                    )
+                    items.append(
+                        {
+                            "index": global_index,
+                            "prompt_index": prompt_idx,
+                            "waveform_index": local_idx,
+                            "prompt": prompt,
+                            "audio": artifact_ref(
+                                self.relative_to(save_path, artifacts_dir)
+                            ),
+                        }
+                    )
+                    global_index += 1
 
         if not items:
             raise ExecutionError("omni_text2audio produced no savable waveforms.")
@@ -194,7 +217,6 @@ class OmniText2AudioExecutor(OmniExecutorBase):
         storyboard = spec_dict.get("storyboard")
         if isinstance(storyboard, dict):
             result["storyboard"] = dict(storyboard)
-        maybe_upload_artifacts(task, out_dir, logger=logger)
         return result
 
     # ── model ────────────────────────────────────────────────────────────

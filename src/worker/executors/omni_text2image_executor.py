@@ -15,12 +15,14 @@ except Exception:
         Omni = None
     _HAS_OMNI = False
 
+from shared.schemas.governance import SpanType
+from shared.tasks.specs import TaskSpecStrictBase
 from shared.tasks.specs.omni import OmniText2ImageSpecStrict
 from shared.utils.parsing import as_list
 
 from .base_executor import ExecutionError, ExecutorTask
 from .omni_executor_base import OmniExecutorBase
-from .utils.checkpoints import artifact_ref, maybe_upload_artifacts
+from .utils.checkpoints import artifact_ref
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,7 @@ class OmniText2ImageExecutor(OmniExecutorBase):
     """Generate images using vllm_omni.Omni."""
 
     name = "omni_text2image"
+    _TASK_SPEC_TYPE = OmniText2ImageSpecStrict
 
     def prepare(self) -> None:
         if not _HAS_OMNI:
@@ -36,43 +39,58 @@ class OmniText2ImageExecutor(OmniExecutorBase):
                 "vllm_omni is not installed; cannot use omni_text2image executor."
             )
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
-        spec = self.require_spec(task, OmniText2ImageSpecStrict)
-        spec_dict = spec.model_dump(by_alias=True)
-        out_dir = Path(out_dir).resolve()
+    def _run_inner(
+        self,
+        task: ExecutorTask,
+        spec: TaskSpecStrictBase,
+        spec_dict: dict[str, Any],
+        out_dir: Path,
+    ) -> dict[str, Any]:
+        assert isinstance(spec, OmniText2ImageSpecStrict)
+        prompts = self._collect_text_inputs(spec, task.task_id)
 
-        prompts = self.collect_text_inputs(spec_dict)
-        if not prompts:
-            raise ExecutionError(
-                "omni_text2image requires prompts "
-                "in spec.data.prompt or spec.data.items."
-            )
-
-        self._ensure_omni(spec_dict)
+        with self._span(
+            "model load",
+            span_type=SpanType.COMPUTE,
+            attributes={"task_id": task.task_id, "prompt_count": len(prompts)},
+        ):
+            self._ensure_omni(spec_dict)
         cfg = self.omni_cfg(spec_dict, "omni:image generation", "omni_text2image")
-        fmt = str(cfg.get("output_format") or "png").strip().lower() or "png"
+        fmt = str(cfg.get("output_format") or "").strip().lower() or "png"
 
         artifacts_dir = out_dir / "artifacts"
         items: list[dict[str, Any]] = []
-        images = self._generate_images(prompts)
-        for idx, (prompt, image) in enumerate(zip(prompts, images)):
-            save_path = self.resolve_save_path(
-                cfg,
-                out_dir,
-                index=idx,
-                ext=fmt,
-                multi=len(prompts) > 1,
-                default_prefix="generated_image",
-            )
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            _save_image(image, save_path)
-            items.append(
-                {
-                    "index": idx,
-                    "prompt": prompt,
-                    "image": artifact_ref(self.relative_to(save_path, artifacts_dir)),
-                }
-            )
+        with self._span(
+            "generation",
+            span_type=SpanType.COMPUTE,
+            attributes={"task_id": task.task_id, "prompt_count": len(prompts)},
+        ):
+            images = self._generate_images(prompts)
+        with self._span(
+            "output postprocessing",
+            span_type=SpanType.COMPUTE,
+            attributes={"task_id": task.task_id, "item_count": len(prompts)},
+        ):
+            for idx, (prompt, image) in enumerate(zip(prompts, images)):
+                save_path = self.resolve_save_path(
+                    cfg,
+                    out_dir,
+                    index=idx,
+                    ext=fmt,
+                    multi=len(prompts) > 1,
+                    default_prefix="generated_image",
+                )
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                _save_image(image, save_path)
+                items.append(
+                    {
+                        "index": idx,
+                        "prompt": prompt,
+                        "image": artifact_ref(
+                            self.relative_to(save_path, artifacts_dir)
+                        ),
+                    }
+                )
 
         first = items[0]["image"] if items else {}
         result: dict[str, Any] = {
@@ -83,7 +101,6 @@ class OmniText2ImageExecutor(OmniExecutorBase):
             "image": first,
             "items": items,
         }
-        maybe_upload_artifacts(task, out_dir, logger=logger)
         return result
 
     # ── model ────────────────────────────────────────────────────────────
