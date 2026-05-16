@@ -403,6 +403,8 @@ class DataMixin(GovernanceMixin):
                 metadata_raw.append(entry_meta)
         elif dtype == "list":
             items = data.get("items")
+            context: dict[str, Any] | None = None
+            root_node: str | None = None
             if items is None:
                 expr = data.get("expr")
                 if not expr:
@@ -415,11 +417,6 @@ class DataMixin(GovernanceMixin):
                     resolved_expr = expr.strip()
                     items = _evaluate_expr(resolved_expr, context)
                     root_node = resolved_expr.split(".", 1)[0] or None
-                    if isinstance(items, list):
-                        items = [
-                            maybe_resolve_artifact_ref(item, context, root_node)
-                            for item in items
-                        ]
             if not isinstance(items, list):
                 raise ExecutionError(
                     "spec.data.items must be a list or resolve to a list "
@@ -427,6 +424,10 @@ class DataMixin(GovernanceMixin):
                 )
             if fetch_images:
                 items, image_group_sizes = self._flatten_grouped_image_items(items)
+                items = [
+                    maybe_resolve_artifact_ref(item, context, root_node)
+                    for item in items
+                ]
 
                 s3_entries: list[tuple[int, str]] = []
 
@@ -503,6 +504,10 @@ class DataMixin(GovernanceMixin):
                     raise ExecutionError("Missing image data for one or more items.")
                 prompts = [x if isinstance(x, str) else "" for x in items]
             else:
+                items = [
+                    maybe_resolve_artifact_ref(item, context, root_node)
+                    for item in items
+                ]
                 prompts, apply_chat_template, found_system_prompt = (
                     normalize_prompt_payload(items)
                 )
