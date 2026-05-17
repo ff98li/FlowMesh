@@ -9,9 +9,33 @@ from unittest.mock import MagicMock, patch
 
 from tests.worker.factories import make_live_worker_config
 from worker.config import WorkerConfig
-from worker.executors.ssh_executor import SSHExecutor
+from worker.executors.ssh_executor import SSHConfig, SSHExecutor
 
 _SSH_NETWORK_NAME = "flowmesh_ssh_test"
+
+
+def _ssh_config(image: str = "myimg:latest") -> SSHConfig:
+    return SSHConfig(
+        image=image,
+        interactive=True,
+        user="flowmesh",
+        authorized_keys=[],
+        command=None,
+        entrypoint=None,
+        ttl_sec=60.0,
+        idle_sec=30.0,
+        access_mode="direct",
+        extra_env={},
+        inputs=[],
+        output=None,
+        mounts=[],
+        poll_interval_sec=1.0,
+        stop_timeout_sec=5.0,
+        cpu_limit=None,
+        memory_limit_bytes=None,
+        pids_limit=None,
+        gpu_device_ids=[],
+    )
 
 
 def _worker_config(
@@ -203,7 +227,7 @@ class TestBuildRunKwargsNetwork:
         executor._ssh_network = _SSH_NETWORK_NAME
 
         kwargs = executor._build_run_kwargs(
-            image="myimg:latest",
+            _ssh_config(),
             container_name="worker-1_ssh-task-1234",
             environment={},
             labels={},
@@ -220,7 +244,7 @@ class TestBuildRunKwargsNetwork:
         executor._ssh_network = None
 
         kwargs = executor._build_run_kwargs(
-            image="myimg:latest",
+            _ssh_config(),
             container_name="worker-1_ssh-task-1234",
             environment={},
             labels={},
@@ -237,7 +261,7 @@ class TestBuildRunKwargsNetwork:
         executor._ssh_network = _SSH_NETWORK_NAME
 
         kwargs = executor._build_run_kwargs(
-            image="myimg:latest",
+            _ssh_config(),
             container_name="c",
             environment={},
             labels={},

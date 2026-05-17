@@ -29,18 +29,24 @@ from typing import TYPE_CHECKING, Any, cast
 
 import requests
 
+from shared.tasks.components.resources import GPURequirements
 from shared.tasks.specs.ssh import (
     SSHInputSpec,
     SSHMountSpec,
     SSHOutputSpec,
     SSHSpecStrict,
 )
-from shared.utils import new_ssh_session_id, parse_float_env
+from shared.tasks.worker_message import WorkerHardware
+from shared.utils import new_ssh_session_id, parse_float_env, parse_mem_to_bytes
+from shared.utils.hardware import (
+    parse_gpu_memory_bytes,
+    select_matching_gpu_indices,
+    unified_gpu_memory_satisfies,
+)
 from shared.utils.http import auth_headers
 from shared.utils.manifest import ARTIFACTS_DIR, prepare_output_dir
 from worker.config import WorkerConfig
 from worker.executors.utils.checkpoints import maybe_upload_artifacts
-from worker.lifecycle import Lifecycle
 
 from .base_executor import (
     ExecutionError,
@@ -155,9 +161,18 @@ class SSHConfig:
     mounts: list[SSHMountSpec]
     poll_interval_sec: float
     stop_timeout_sec: float
+    cpu_limit: float | None
+    memory_limit_bytes: int | None
+    pids_limit: int | None
+    gpu_device_ids: list[str]
 
     @classmethod
-    def from_spec(cls, spec: SSHSpecStrict) -> "SSHConfig":
+    def from_spec(
+        cls,
+        spec: SSHSpecStrict,
+        worker_cfg: WorkerConfig,
+        hardware: WorkerHardware | None = None,
+    ) -> "SSHConfig":
         """Build a resolved config from a task spec, env vars, and defaults."""
         has_gpu = bool(os.getenv("WORKER_HOST_GPU_ID", "").strip())
         fallback_image = _DEFAULT_IMAGE_GPU if has_gpu else _DEFAULT_IMAGE_CPU
@@ -173,6 +188,10 @@ class SSHConfig:
             if (ssh_output := spec.sshOutput)
             else None
         )
+        cpu_limit, memory_limit_bytes, pids_limit = _resolve_resource_limits(
+            spec, worker_cfg
+        )
+        gpu_device_ids = _resolve_gpu_devices(spec, worker_cfg, hardware)
         return cls(
             image=spec.image or default_image,
             interactive=bool(spec.interactive),
@@ -189,7 +208,165 @@ class SSHConfig:
             mounts=list(spec.mounts or []),
             poll_interval_sec=poll_interval_sec,
             stop_timeout_sec=stop_timeout_sec,
+            cpu_limit=cpu_limit,
+            memory_limit_bytes=memory_limit_bytes,
+            pids_limit=pids_limit,
+            gpu_device_ids=gpu_device_ids,
         )
+
+
+def _resolve_resource_limits(
+    spec: SSHSpecStrict, worker_cfg: WorkerConfig
+) -> tuple[float | None, int | None, int | None]:
+    """Resolve effective CPU/memory limits as min(task spec, worker cap).
+
+    Returns ``(cpu_limit, memory_limit_bytes, pids_limit)``. Each of them may be
+    ``None`` to mean unbounded — that is, neither the spec nor the cap constrains it.
+    """
+    spec_cpu: float | None = None
+    spec_mem_bytes: int | None = None
+    if (res := spec.resources) and (hw := res.hardware):
+        if hw.cpu is not None:
+            spec_cpu = float(hw.cpu)
+        if hw.memory is not None:
+            if isinstance(hw.memory, str):
+                spec_mem_bytes = parse_mem_to_bytes(hw.memory)
+                if spec_mem_bytes is None:
+                    raise ExecutionError(
+                        f"resources.hardware.memory value {hw.memory!r} is not "
+                        "a valid memory string (e.g. '8Gi', '512Mi')"
+                    )
+            else:
+                spec_mem_bytes = int(hw.memory)
+
+    ssh_limits = worker_cfg.ssh_limits
+    if ssh_limits is None:
+        return spec_cpu, spec_mem_bytes, None
+
+    cpu_limit = _min_or_none(spec_cpu, ssh_limits.max_cpu_cores)
+    if (
+        spec_cpu is not None
+        and ssh_limits.max_cpu_cores is not None
+        and spec_cpu > ssh_limits.max_cpu_cores
+    ):
+        logger.warning(
+            "SSH task requested cpu=%s but worker cap is %s; clamping to cap",
+            spec_cpu,
+            ssh_limits.max_cpu_cores,
+        )
+
+    memory_limit_bytes = _min_or_none(spec_mem_bytes, ssh_limits.max_memory_bytes)
+    if (
+        spec_mem_bytes is not None
+        and ssh_limits.max_memory_bytes is not None
+        and spec_mem_bytes > ssh_limits.max_memory_bytes
+    ):
+        logger.warning(
+            "SSH task requested memory=%d bytes but worker cap is %d; "
+            "clamping to cap",
+            spec_mem_bytes,
+            ssh_limits.max_memory_bytes,
+        )
+
+    return cpu_limit, memory_limit_bytes, ssh_limits.max_pids
+
+
+def _min_or_none[T: (int, float)](a: T | None, b: T | None) -> T | None:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return min(a, b)
+
+
+def _resolve_gpu_devices(
+    spec: SSHSpecStrict, config: WorkerConfig, hardware: WorkerHardware | None
+) -> list[str]:
+    """Pick the smallest subset of the worker's GPUs that satisfies the spec.
+
+    Returns the *host* device IDs to expose to the SSH container. When the spec
+    sets no GPU constraints at all, returns the worker's full host GPU set;
+    when only ``type`` or ``memory`` is set without ``count``, defaults to
+    slicing a single matching device.
+    """
+    host_gpu_ids = [
+        d_stripped
+        for d in os.getenv("WORKER_HOST_GPU_ID", "").split(",")
+        if (d_stripped := d.strip())
+    ]
+    if not config.enable_ssh_gpu_limit:
+        return host_gpu_ids
+
+    gpu_req: GPURequirements | None = None
+    if (res := spec.resources) and (hw := res.hardware):
+        gpu_req = hw.gpu
+    if gpu_req is None or (
+        gpu_req.count is None and not gpu_req.type and not gpu_req.memory
+    ):
+        return host_gpu_ids
+
+    requested = gpu_req.count if gpu_req.count is not None else 1
+    if requested <= 0:
+        return []
+
+    if not host_gpu_ids:
+        raise ExecutionError(
+            f"SSH task requested {requested} GPU(s) but this worker has none"
+        )
+
+    # The supervisor passes WORKER_HOST_GPU_ID in the same order as
+    # worker.hardware.gpu.devices, so positions line up 1:1. When metadata is
+    # missing or misaligned, fall back to count-only slicing.
+    devices = hardware.gpu.devices if hardware is not None else []
+    if devices and len(devices) != len(host_gpu_ids):
+        logger.warning(
+            "WORKER_HOST_GPU_ID (%d) and worker hardware.gpu.devices (%d) "
+            "disagree; falling back to count-only slicing",
+            len(host_gpu_ids),
+            len(devices),
+        )
+        devices = []
+
+    required_mem_bytes: int | None = None
+    if gpu_req.memory:
+        required_mem_bytes = parse_gpu_memory_bytes(gpu_req.memory)
+        if required_mem_bytes is None:
+            raise ExecutionError(
+                f"resources.hardware.gpu.memory value {gpu_req.memory!r} is "
+                "not a valid memory string (e.g. '40Gi', '80GB')"
+            )
+
+    if not devices:
+        # No per-device metadata to filter by — fall back to first-N host IDs.
+        if len(host_gpu_ids) < requested:
+            raise ExecutionError(
+                f"SSH task requested {requested} GPU(s) but only "
+                f"{len(host_gpu_ids)} are available on this worker"
+            )
+        return host_gpu_ids[:requested]
+
+    matching_indices = select_matching_gpu_indices(devices, gpu_req, limit=requested)
+    if len(matching_indices) >= requested:
+        return [host_gpu_ids[idx] for idx in matching_indices]
+
+    # Unified memory fallback
+    if required_mem_bytes is not None and hardware is not None:
+        type_only_req = GPURequirements(
+            count=gpu_req.count, type=gpu_req.type, memory=None
+        )
+        type_matching = select_matching_gpu_indices(
+            devices, type_only_req, limit=requested
+        )
+        if len(type_matching) >= requested and unified_gpu_memory_satisfies(
+            hardware, required_mem_bytes, requested
+        ):
+            return [host_gpu_ids[idx] for idx in type_matching]
+
+    raise ExecutionError(
+        f"SSH task requested {requested} GPU(s) matching the spec but "
+        f"only {len(matching_indices)} satisfying device(s) are available "
+        "on this worker"
+    )
 
 
 class SSHExecutor(Executor):
@@ -197,10 +374,10 @@ class SSHExecutor(Executor):
 
     name = "ssh"
 
-    def __init__(
-        self, config: WorkerConfig, lifecycle: Lifecycle | None = None
-    ) -> None:
-        super().__init__(config, lifecycle)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        config = self._config
+        lifecycle = self._lifecycle
         self._worker_name = (
             config.container_name
             or config.alias
@@ -250,7 +427,7 @@ class SSHExecutor(Executor):
 
     def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
         spec = self.require_spec(task, SSHSpecStrict)
-        cfg = SSHConfig.from_spec(spec)
+        cfg = SSHConfig.from_spec(spec, self._config, self._hardware)
         access_mode = cfg.access_mode
         interactive = cfg.interactive
 
@@ -291,9 +468,10 @@ class SSHExecutor(Executor):
             mount_plan.staged_input_specs,
             mount_plan.create_dirs,
             interactive,
+            cfg.gpu_device_ids,
         )
         kwargs = self._build_run_kwargs(
-            cfg.image,
+            cfg,
             container_name,
             environment,
             labels,
@@ -476,6 +654,7 @@ class SSHExecutor(Executor):
         staged_input_specs: list[tuple[str, str]],
         create_dirs: list[str],
         interactive: bool,
+        gpu_device_ids: list[str] | None = None,
     ) -> dict[str, str]:
         env: dict[str, str] = {}
         if interactive:
@@ -484,9 +663,12 @@ class SSHExecutor(Executor):
                 env["AUTHORIZED_KEYS"] = "\n".join(authorized_keys)
             env["SSH_UID"] = str(os.getuid())
             env["SSH_GID"] = str(os.getgid())
-        cuda = os.getenv("CUDA_VISIBLE_DEVICES")
-        if cuda is not None:
-            env["CUDA_VISIBLE_DEVICES"] = cuda
+        if gpu_device_ids:
+            # Docker exposes only the sliced devices, which appear as 0..N-1
+            # inside the container regardless of their host IDs.
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(
+                str(i) for i in range(len(gpu_device_ids))
+            )
         if staged_input_specs:
             env["FLOWMESH_STAGED_INPUT_SPECS"] = "\n".join(
                 f"{mount_path}\t{target_path}"
@@ -501,7 +683,7 @@ class SSHExecutor(Executor):
 
     def _build_run_kwargs(
         self,
-        image: str,
+        cfg: SSHConfig,
         container_name: str,
         environment: dict[str, str],
         labels: dict[str, str],
@@ -511,7 +693,7 @@ class SSHExecutor(Executor):
         interactive: bool,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
-            "image": image,
+            "image": cfg.image,
             "name": container_name,
             "environment": environment,
             "labels": labels,
@@ -525,16 +707,18 @@ class SSHExecutor(Executor):
             kwargs["entrypoint"] = [_SSH_RUN_ENTRYPOINT_PATH]
             if command:
                 kwargs["command"] = command
-        # WORKER_HOST_GPU_ID holds the real host device IDs assigned by the
-        # server (e.g. "2,3").
-        host_gpu_ids = os.getenv("WORKER_HOST_GPU_ID", "").strip()
-        if host_gpu_ids:
-            device_ids = [
-                d_stripped for d in host_gpu_ids.split(",") if (d_stripped := d.strip())
-            ]
+        if cfg.cpu_limit is not None:
+            kwargs["nano_cpus"] = int(cfg.cpu_limit * 1_000_000_000)
+        if cfg.memory_limit_bytes is not None:
+            kwargs["mem_limit"] = cfg.memory_limit_bytes
+        if cfg.pids_limit is not None:
+            kwargs["pids_limit"] = cfg.pids_limit
+        if cfg.gpu_device_ids:
             try:
                 kwargs["device_requests"] = [
-                    DeviceRequest(device_ids=device_ids, capabilities=[["gpu"]])
+                    DeviceRequest(
+                        device_ids=list(cfg.gpu_device_ids), capabilities=[["gpu"]]
+                    )
                 ]
                 if runtime := self._docker_gpu_runtime:
                     kwargs["runtime"] = runtime

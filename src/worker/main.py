@@ -2,6 +2,8 @@ import argparse
 import logging
 import signal
 
+from shared.tasks.worker_message import WorkerHardware
+
 from .config import WorkerConfig
 from .executors import EXECUTOR_CLASS_NAMES, EXECUTOR_REGISTRY, IMPORT_ERRORS
 from .executors.base_executor import Executor
@@ -51,6 +53,7 @@ def _parse_args() -> argparse.Namespace:
 
 def initialize_executors(
     config: WorkerConfig,
+    hardware: WorkerHardware,
     logger: logging.Logger,
     lifecycle: Lifecycle,
     registry: dict[str, type | None] | None = None,
@@ -93,8 +96,8 @@ def initialize_executors(
 
         try:
             if key in configured_wrapped:
-                return MPExecutor(cls, config=config)
-            return cls(config, lifecycle)
+                return MPExecutor(cls, config, hardware)
+            return cls(config, hardware, lifecycle)
         except Exception as exc:
             logger.warning("Failed to initialize executor %s: %s", key, exc)
             return None
@@ -190,10 +193,19 @@ def main() -> None:
     )
     hardware = collect_hw(bandwidth_bytes_per_sec=cfg.network_bandwidth_bytes_per_sec)
     logger.info("Collected hardware info: %s", hardware)
-    lifecycle.start(env={}, hardware=hardware, tags=cfg.tags)
+    ssh_limits = cfg.ssh_limits
+    if ssh_limits is None:
+        logger.warning(
+            "SSH resource cap not configured; SSH sessions will be able to access "
+            "full host resources of this worker."
+        )
+    else:
+        logger.info("SSH resource cap: %s", ssh_limits.model_dump())
+    lifecycle.start(env={}, hardware=hardware, ssh_limits=ssh_limits, tags=cfg.tags)
 
     executors, default_executor = initialize_executors(
         cfg,
+        hardware,
         logger,
         lifecycle,
         enable_mp_executors=cfg.enable_mp_executors,
