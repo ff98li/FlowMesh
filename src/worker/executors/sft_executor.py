@@ -22,6 +22,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl.trainer.sft_config import SFTConfig
 from trl.trainer.sft_trainer import SFTTrainer
 
+from shared.schemas.artifact import ArtifactRef
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks.specs import SFTSpecStrict, TaskSpecStrictBase
 from shared.utils.manifest import scratch_dir
 
@@ -30,7 +32,6 @@ from .base_executor import ExecutionError, Executor, ExecutorTask
 from .mixins.training import TrainingMixin
 from .utils.checkpoints import (
     archive_model_dir,
-    artifact_ref,
     determine_resume_path,
     get_http_destination,
     maybe_upload_artifacts,
@@ -41,6 +42,19 @@ from .utils.distributed import deepspeed_available, run_deepspeed, run_torchrun
 from .utils.huggingface import build_hf_load_kwargs, pick_torch_dtype
 
 logger = logging.getLogger("worker.sft")
+
+
+class SFTResult(BaseExecutorResult):
+    training_time_seconds: float | None = None
+    error_message: str | None = None
+    model_name: str | None = None
+    dataset_size: int = 0
+    output_dir: str | None = None
+    checkpoints_dir: ArtifactRef | None = None
+    resume_from_path: str | None = None
+    final_model: ArtifactRef | None = None
+    final_model_archive: ArtifactRef | None = None
+    spawned_torchrun: bool = False
 
 
 class SFTExecutor(TrainingMixin, Executor):
@@ -55,12 +69,12 @@ class SFTExecutor(TrainingMixin, Executor):
         self._final_model_dir: Path | None = None
         self._task_out_dir: Path | None = None
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
+    def run(self, task: ExecutorTask, out_dir: Path) -> SFTResult:
         configure_hf_library_logging()
         spec = self.require_spec(task, SFTSpecStrict)
         requested_gpu_count = self._requested_gpu_count(spec)
         start_time = time.time()
-        training_successful = False
+        ok = False
         error_msg: str | None = None
         caught_exc: Exception | None = None
         self._task_out_dir = out_dir
@@ -189,22 +203,22 @@ class SFTExecutor(TrainingMixin, Executor):
                     )
                 ipc_path = scratch_dir(out_dir) / "distributed_result.json"
                 if ipc_path.exists():
-                    distributed_result = self.load_json(ipc_path)
                     self._task_out_dir = None
-                    return distributed_result
+                    return SFTResult.model_validate(self.load_json(ipc_path))
                 self._task_out_dir = None
-                return {
-                    "training_successful": True,
-                    "spawned_torchrun": True,
-                    "model_name": spec.model_name,
-                    "output_dir": out_dir.as_posix(),
-                }
+                return SFTResult(
+                    spawned_torchrun=True,
+                    model_name=spec.model_name,
+                    output_dir=out_dir.as_posix(),
+                )
         except Exception as spawn_exc:
             logger.exception("Failed to launch distributed SFT: %s", spawn_exc)
             raise ExecutionError(
                 "Failed to launch distributed SFT subprocess"
             ) from spawn_exc
 
+        resume_path: Path | None = None
+        train_dataset: Any = None
         try:
             # Proceed with in-process training (single GPU or inside torchrun)
             model_name = spec.model_name or "gpt2"
@@ -213,7 +227,7 @@ class SFTExecutor(TrainingMixin, Executor):
             resume_path = determine_resume_path(
                 spec, training_cfg, out_dir, logger=logger
             )
-            resume_str = str(resume_path) if resume_path else None
+            resume_str = resume_path.as_posix() if resume_path else None
 
             if resume_path:
                 logger.info(
@@ -291,7 +305,7 @@ class SFTExecutor(TrainingMixin, Executor):
                 )
 
             sft_config = SFTConfig(
-                output_dir=str(checkpoint_dir),
+                output_dir=checkpoint_dir.as_posix(),
                 num_train_epochs=float(training_cfg.get("num_train_epochs", 1.0)),
                 per_device_train_batch_size=int(training_cfg.get("batch_size", 2)),
                 gradient_accumulation_steps=int(
@@ -394,14 +408,14 @@ class SFTExecutor(TrainingMixin, Executor):
 
             logger.info("Starting supervised fine-tuning")
             trainer.train()
-            training_successful = True
+            ok = True
             logger.info("Training finished")
 
             final_model_path: Path | None = None
             final_archive_path: Path | None = None
             if bool(training_cfg.get("save_model", True)):
                 model_path = artifacts_dir / "final_model"
-                trainer.save_model(str(model_path))
+                trainer.save_model(model_path.as_posix())
                 tokenizer.save_pretrained(model_path)
                 final_model_path = model_path
                 logger.info("Saved fine-tuned model to %s", model_path)
@@ -422,30 +436,35 @@ class SFTExecutor(TrainingMixin, Executor):
                 )
 
             training_time = time.time() - start_time
-            result_payload: dict[str, Any] = {
-                "task_id": task.task_id,
-                "training_successful": training_successful,
-                "training_time_seconds": training_time,
-                "error_message": error_msg,
-                "model_name": self._model_name,
-                "dataset_size": len(train_dataset),
-                "output_dir": out_dir.as_posix(),
-                "checkpoints_dir": artifact_ref("checkpoints"),
-                "resume_from_path": resume_str,
-            }
-
-            if final_model_path is not None:
+            final_model: ArtifactRef | None = None
+            final_model_archive: ArtifactRef | None = None
+            if final_model_path:
                 resolved_model_path = Path(final_model_path)
                 self._final_model_dir = (
                     resolved_model_path if resolved_model_path.exists() else None
                 )
-                result_payload["final_model"] = artifact_ref(
-                    final_model_path.relative_to(artifacts_dir).as_posix()
+                final_model = ArtifactRef(
+                    path=final_model_path.relative_to(artifacts_dir).as_posix()
                 )
-                if final_archive_path is not None:
-                    result_payload["final_model_archive"] = artifact_ref(
-                        final_archive_path.relative_to(artifacts_dir).as_posix()
+                final_model_archive = (
+                    ArtifactRef(
+                        path=final_archive_path.relative_to(artifacts_dir).as_posix()
                     )
+                    if final_archive_path
+                    else None
+                )
+            result = SFTResult(
+                ok=ok,
+                training_time_seconds=training_time,
+                error_message=error_msg,
+                model_name=self._model_name,
+                dataset_size=len(train_dataset),
+                output_dir=out_dir.as_posix(),
+                checkpoints_dir=ArtifactRef(path="checkpoints"),
+                resume_from_path=resume_str,
+                final_model=final_model,
+                final_model_archive=final_model_archive,
+            )
 
             maybe_upload_artifacts(task, out_dir, logger=logger)
 
@@ -467,11 +486,11 @@ class SFTExecutor(TrainingMixin, Executor):
             self._final_model_dir = None
 
             self._task_out_dir = None
-            return result_payload
+            return result
 
         except Exception as exc:
             error_msg = str(exc)
-            training_successful = False
+            ok = False
             caught_exc = exc
             logger.exception("SFT training failed: %s", exc)
             trainer = None
@@ -484,23 +503,20 @@ class SFTExecutor(TrainingMixin, Executor):
             self._final_model_dir = None
 
         training_time = time.time() - start_time
-        result: dict[str, Any] = {
-            "task_id": task.task_id,
-            "training_successful": training_successful,
-            "training_time_seconds": training_time,
-            "error_message": error_msg,
-            "model_name": self._model_name,
-            "dataset_size": (
+        result = SFTResult(
+            ok=ok,
+            training_time_seconds=training_time,
+            error_message=error_msg,
+            model_name=self._model_name,
+            dataset_size=(
                 len(train_dataset)
                 if "train_dataset" in locals() and train_dataset is not None
                 else 0
             ),
-            "output_dir": out_dir.as_posix(),
-            "checkpoints_dir": artifact_ref("checkpoints"),
-            "resume_from_path": (
-                str(resume_path) if "resume_path" in locals() and resume_path else None
-            ),
-        }
+            output_dir=out_dir.as_posix(),
+            checkpoints_dir=ArtifactRef(path="checkpoints"),
+            resume_from_path=resume_path.as_posix() if resume_path else None,
+        )
         write_executor_result(out_dir / "results.json", task.task_id, task.spec, result)
         if caught_exc is not None:
             self._task_out_dir = None
@@ -602,7 +618,7 @@ class SFTExecutor(TrainingMixin, Executor):
                     timeout=timeout,
                     logger=logger,
                 )
-                jsonl_cfg["path"] = str(resolved)
+                jsonl_cfg["path"] = resolved.as_posix()
                 return resolved
             except ExecutionError as exc:
                 last_error = exc
@@ -823,13 +839,13 @@ class SFTExecutor(TrainingMixin, Executor):
         if isinstance(cfg, dict):
             return cfg
         if isinstance(cfg, (str, Path)):
-            candidate = Path(str(cfg)).expanduser()
+            candidate = Path(cfg).expanduser()
             if candidate.exists():
                 log.info("Using DeepSpeed config at %s", candidate)
-                return str(candidate)
+                return candidate.as_posix()
             # Allow literal identifiers (e.g., 'auto') without file presence.
             log.info("Using DeepSpeed literal configuration '%s'", cfg)
-            return str(cfg)
+            return cfg if isinstance(cfg, str) else cfg.as_posix()
         raise ValueError("training.deepspeed must be a dict, path string, or falsy")
 
     @staticmethod

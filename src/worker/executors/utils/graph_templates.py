@@ -5,13 +5,17 @@ from collections.abc import Sequence
 from typing import Any
 
 import pandas as pd
+from pydantic import BaseModel
 
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks.specs import TaskSpecStrictBase
 from shared.utils.json import validate_keys
 
 from ...utils.serialization import try_deserialize_dataframe
 from ..base_executor import ExecutionError
 from .safe_eval import safe_execute_function, safe_materialize_function
+
+_SENTINEL: Any = object()
 
 type MessageItem = dict[str, str]
 type Message = Sequence[MessageItem]
@@ -81,7 +85,7 @@ def build_prompts_from_graph_template(
 def _maybe_broadcast_image_prompts(
     prompts: Sequence[str | Message],
     data_cfg: dict[str, Any],
-    context: dict[str, Any],
+    context: dict[str, BaseExecutorResult],
 ) -> list[str | Message]:
     image_embedding = data_cfg.get("image_embedding")
     if not isinstance(image_embedding, dict):
@@ -95,7 +99,7 @@ def _maybe_broadcast_image_prompts(
 
 
 def _resolve_image_embedding_count(
-    image_embedding: dict[str, Any], context: dict[str, Any]
+    image_embedding: dict[str, Any], context: dict[str, BaseExecutorResult]
 ) -> int | None:
     node = image_embedding.get("node")
     if not isinstance(node, str):
@@ -105,15 +109,17 @@ def _resolve_image_embedding_count(
     if not isinstance(node, str) or not node:
         return None
     upstream = context.get(node)
-    if not isinstance(upstream, dict):
+    if upstream is None:
         return None
-    count = upstream.get("count")
+    count = getattr(upstream, "count", _SENTINEL)
     if isinstance(count, int) and count > 0:
         return count
     return None
 
 
-def _resolve_columns(columns_cfg: Any, context: dict[str, Any]) -> list[dict[str, Any]]:
+def _resolve_columns(
+    columns_cfg: Any, context: dict[str, BaseExecutorResult]
+) -> list[dict[str, Any]]:
     if not isinstance(columns_cfg, list):
         raise ExecutionError("graph_template.template.columns must be a list.")
 
@@ -580,17 +586,17 @@ def _format_column_line(label: str, value: str) -> str:
     return f"• {label}: {indented}"
 
 
-def _evaluate_expr(expr: str, context: dict[str, Any]) -> Any:
+def _evaluate_expr(expr: str, context: dict[str, BaseExecutorResult]) -> Any:
     if not expr:
         return None
 
     parts = expr.split(".")
     root = parts[0]
-    data = context.get(root)
-    if data is None:
+    result = context.get(root)
+    if result is None:
         return None
 
-    value: Any = data
+    value: Any = result
     for token in parts[1:]:
         if not token:
             continue
@@ -617,6 +623,14 @@ def _evaluate_expr(expr: str, context: dict[str, Any]) -> Any:
                         f"{attr} not a valid column in DataFrame for {token}."
                     )
                 value = value[attr].tolist()
+            elif isinstance(value, BaseModel):
+                resolved = getattr(value, attr, _SENTINEL)
+                if resolved is _SENTINEL:
+                    raise ExecutionError(
+                        f"{attr} not a valid attribute of {type(value).__name__} "
+                        f"for {token}."
+                    )
+                value = resolved
             else:
                 raise ExecutionError(
                     f"{attr} in {parts} is not a valid key - "

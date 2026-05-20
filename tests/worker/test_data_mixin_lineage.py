@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from PIL import Image
 
+from shared.schemas.result import BaseExecutorResult
 from worker.executors.mixins.data import DataMixin
 
 
@@ -96,14 +97,16 @@ def test_dump_to_governance_with_merged_children(tmp_path: Path) -> None:
     mixin = _Mixin()
     out_dir = tmp_path / "task"
     with mixin._task_span("tsk-parent", "wfl-1", out_dir, owner_id="alice"):
-        result = {
-            "ok": True,
-            "items": [{"output": "p"}],
-            "children": {
-                "tsk-c1": {"items": [{"output": "c1"}]},
-                "tsk-c2": {"items": [{"output": "c2"}]},
-            },
-        }
+        result = BaseExecutorResult.model_validate(
+            {
+                "ok": True,
+                "items": [{"output": "p"}],
+                "children": {
+                    "tsk-c1": {"items": [{"output": "c1"}]},
+                    "tsk-c2": {"items": [{"output": "c2"}]},
+                },
+            }
+        )
         deps = {
             "tsk-parent": ["tsk-up-a"],
             "tsk-c1": ["tsk-up-b"],
@@ -143,20 +146,21 @@ def test_collect_prompts_resolves_grouped_image_artifact_refs_after_flatten(
     for name, color in (("a.png", "red"), ("b.png", "green"), ("c.png", "blue")):
         Image.new("RGB", (2, 2), color=color).save(artifacts_dir / name)
 
+    result = BaseExecutorResult.model_validate(
+        {
+            "images": [
+                [{"path": "images/a.png"}, {"path": "images/b.png"}],
+                [{"path": "images/c.png"}],
+            ],
+            "_artifacts": {"base_dir": upstream_dir.as_posix()},
+        }
+    )
     spec = cast(
         Any,
         SimpleNamespace(
             data={"type": "list", "expr": "vision.images"},
             inference={},
-            upstreamResults={
-                "vision": {
-                    "images": [
-                        [{"path": "images/a.png"}, {"path": "images/b.png"}],
-                        [{"path": "images/c.png"}],
-                    ],
-                    "_artifacts": {"base_dir": upstream_dir.as_posix()},
-                }
-            },
+            upstreamResults={"vision": result},
         ),
     )
 

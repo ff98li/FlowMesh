@@ -56,7 +56,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from shared.schemas.artifact import ArtifactRef
 from shared.schemas.governance import SpanType
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks.specs import (
     EmbeddingSpecStrict,
     InferenceSpecStrict,
@@ -66,11 +68,7 @@ from ..utils.logging import configure_hf_library_logging
 from .base_executor import ExecutionError, Executor, ExecutorTask
 from .mixins.data import InferenceEntry
 from .mixins.inference import InferenceMixin
-from .utils.checkpoints import (
-    artifact_ref,
-    maybe_upload_artifacts,
-    maybe_upload_traces,
-)
+from .utils.checkpoints import maybe_upload_artifacts, maybe_upload_traces
 
 try:
     import torch
@@ -113,6 +111,16 @@ except Exception:
     _HAS_TRANSFORMERS = False
 
 logger = logging.getLogger(__name__)
+
+
+class TransformersResult(BaseExecutorResult):
+    ok: bool = True
+    model: str | None = None
+    items: list[dict[str, Any]] = []
+    usage: dict[str, Any] | None = None
+    count: int | None = None
+    embedding_file: ArtifactRef | None = None
+    image_group_sizes: list[int] | None = None
 
 
 class HFTransformersExecutor(InferenceMixin, Executor):
@@ -384,7 +392,7 @@ class HFTransformersExecutor(InferenceMixin, Executor):
             return "length"
         return None
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:  # type: ignore[override]
+    def run(self, task: ExecutorTask, out_dir: Path) -> TransformersResult:
         configure_hf_library_logging()
         spec = task.spec
         if not isinstance(spec, (InferenceSpecStrict, EmbeddingSpecStrict)):
@@ -406,7 +414,7 @@ class HFTransformersExecutor(InferenceMixin, Executor):
         spec: "InferenceSpecStrict | EmbeddingSpecStrict",
         task_id: str,
         out_dir: Path,
-    ) -> dict[str, Any]:
+    ) -> TransformersResult:
         with self._span("model load", span_type=SpanType.COMPUTE):
             self._ensure_model(spec)
 
@@ -422,8 +430,6 @@ class HFTransformersExecutor(InferenceMixin, Executor):
         )
 
         assert self._model is not None
-
-        result: dict[str, Any] = {}
 
         if self._mode == "visual-embedding":
             assert self._image_processor is not None
@@ -479,15 +485,13 @@ class HFTransformersExecutor(InferenceMixin, Executor):
             emb_path = artifacts_dir / "visual_embeddings.pt"
             torch.save(grouped_visual_embeddings, emb_path)
 
-            result = {
-                "ok": True,
-                "model": self._model_name,
-                "items": [],  # Embeddings are in file
-                "count": len(grouped_visual_embeddings),
-                "embedding_file": artifact_ref("visual_embeddings.pt"),
-            }
-            if image_group_sizes is not None:
-                result["image_group_sizes"] = image_group_sizes
+            result = TransformersResult(
+                model=self._model_name,
+                items=[],
+                count=len(grouped_visual_embeddings),
+                embedding_file=ArtifactRef(path="visual_embeddings.pt"),
+                image_group_sizes=image_group_sizes,
+            )
 
             self._dump_to_governance(
                 task_id=task_id,
@@ -593,21 +597,20 @@ class HFTransformersExecutor(InferenceMixin, Executor):
             prompt_tokens += int(input_len)
             completion_tokens += int(gen_part.shape[0])
 
-        result = {
-            "ok": True,
-            "model": self._model_name,
-            "items": items,
-            "usage": {
+        result = TransformersResult(
+            model=self._model_name,
+            items=items,
+            usage={
                 "prompt_tokens": int(prompt_tokens),
                 "completion_tokens": int(completion_tokens),
                 "total_tokens": int(prompt_tokens + completion_tokens),
                 "num_requests": len(self._prompts),
                 "latency_sec": latency,
             },
-        }
+        )
 
         if isinstance(spec, InferenceSpecStrict):
-            self._maybe_export_jsonl(spec, task_id, result, out_dir)
+            self._maybe_export_jsonl(spec, task_id, items, out_dir)
 
         self._dump_to_governance(
             task_id=task_id,

@@ -14,10 +14,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
-
-if TYPE_CHECKING:
-    from deepspeed.runtime.engine import DeepSpeedEngine
+from typing import Any, cast
 
 import torch
 from datasets import Dataset
@@ -33,6 +30,8 @@ from trl.models.modeling_value_head import AutoModelForCausalLMWithValueHead
 from trl.trainer.ppo_config import PPOConfig
 from trl.trainer.ppo_trainer import PPOTrainer
 
+from shared.schemas.artifact import ArtifactRef
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks.specs import PPOSpecStrict
 from shared.utils.manifest import scratch_dir
 from shared.utils.parsing import safe_float, safe_int, to_bool
@@ -42,7 +41,6 @@ from .base_executor import ExecutionError, Executor, ExecutorTask
 from .mixins.training import TrainingMixin
 from .utils.checkpoints import (
     archive_model_dir,
-    artifact_ref,
     get_http_destination,
     maybe_upload_artifacts,
     write_executor_result,
@@ -52,6 +50,18 @@ from .utils.distributed import run_torchrun
 from .utils.huggingface import build_hf_load_kwargs, pick_torch_dtype
 
 logger = logging.getLogger("worker.ppo")
+
+
+class PPOResult(BaseExecutorResult):
+    training_time_seconds: float | None = None
+    error_message: str | None = None
+    model_name: str | None = None
+    dataset_size: int = 0
+    output_dir: str | None = None
+    checkpoints_dir: ArtifactRef | None = None
+    final_model: ArtifactRef | None = None
+    final_model_archive: ArtifactRef | None = None
+    spawned_torchrun: bool = False
 
 
 class _ExternalRewardModel(torch.nn.Module):
@@ -392,7 +402,7 @@ class PPOExecutor(TrainingMixin, Executor):
         self._reward_module: _ExternalRewardModel | _RewardAdapter | None = None
         self._task_out_dir: Path | None = None
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
+    def run(self, task: ExecutorTask, out_dir: Path) -> PPOResult:
         configure_hf_library_logging()
         logger.info("Starting PPO training task")
         spec = self.require_spec(task, PPOSpecStrict)
@@ -418,16 +428,14 @@ class PPOExecutor(TrainingMixin, Executor):
             )
             ipc_path = scratch_dir(out_dir) / "distributed_result.json"
             if ipc_path.exists():
-                result = self.load_json(ipc_path)
                 self._task_out_dir = None
-                return result
+                return PPOResult.model_validate(self.load_json(ipc_path))
             self._task_out_dir = None
-            return {
-                "training_successful": True,
-                "spawned_torchrun": True,
-                "model_name": spec.model_name,
-                "output_dir": out_dir.as_posix(),
-            }
+            return PPOResult(
+                spawned_torchrun=True,
+                model_name=spec.model_name,
+                output_dir=out_dir.as_posix(),
+            )
 
         start_time = time.time()
 
@@ -853,7 +861,7 @@ class PPOExecutor(TrainingMixin, Executor):
                 pass
             logger.info("PPO training completed")
 
-            training_successful = True
+            ok = True
             error_msg = None
 
             # Save model if requested
@@ -881,44 +889,48 @@ class PPOExecutor(TrainingMixin, Executor):
                     logger.warning("Failed to save model: %s", exc)
 
         except Exception as exc:
-            training_successful = False
+            ok = False
             error_msg = str(exc)
             logger.exception("PPO training failed: %s", exc)
             training_time = time.time() - start_time
             dataset_size = len(dataset) if "dataset" in locals() else 0  # type: ignore
-            results = {
-                "training_successful": training_successful,
-                "training_time_seconds": training_time,
-                "error_message": error_msg,
-                "model_name": self._model_name,
-                "dataset_size": dataset_size,
-                "output_dir": out_dir.as_posix(),
-            }
+            result = PPOResult(
+                ok=ok,
+                training_time_seconds=training_time,
+                error_message=error_msg,
+                model_name=self._model_name,
+                dataset_size=dataset_size,
+                output_dir=out_dir.as_posix(),
+            )
             write_executor_result(
-                out_dir / "results.json", task.task_id, task.spec, results
+                out_dir / "results.json", task.task_id, task.spec, result
             )
             self._task_out_dir = None
             raise ExecutionError(error_msg or "PPO training failed") from exc
 
         training_time = time.time() - start_time
 
-        results = {
-            "training_successful": training_successful,
-            "training_time_seconds": training_time,
-            "error_message": error_msg,
-            "model_name": self._model_name,
-            "dataset_size": len(dataset),
-            "output_dir": out_dir.as_posix(),
-            "checkpoints_dir": artifact_ref("checkpoints"),
-        }
-        if final_model_path is not None:
-            results["final_model"] = artifact_ref(
-                final_model_path.relative_to(artifacts_dir).as_posix()
-            )
-        if final_archive_path is not None:
-            results["final_model_archive"] = artifact_ref(
-                final_archive_path.relative_to(artifacts_dir).as_posix()
-            )
+        result = PPOResult(
+            ok=ok,
+            training_time_seconds=training_time,
+            error_message=error_msg,
+            model_name=self._model_name,
+            dataset_size=len(dataset),
+            output_dir=out_dir.as_posix(),
+            checkpoints_dir=ArtifactRef(path="checkpoints"),
+            final_model=(
+                ArtifactRef(path=final_model_path.relative_to(artifacts_dir).as_posix())
+                if final_model_path
+                else None
+            ),
+            final_model_archive=(
+                ArtifactRef(
+                    path=final_archive_path.relative_to(artifacts_dir).as_posix()
+                )
+                if final_archive_path
+                else None
+            ),
+        )
 
         maybe_upload_artifacts(task, out_dir, logger=logger)
 
@@ -931,7 +943,7 @@ class PPOExecutor(TrainingMixin, Executor):
 
         logger.info("PPO training task completed in %.2f seconds", training_time)
         self._task_out_dir = None
-        return results
+        return result
 
     def _ensure_jsonl_local(self, jsonl_cfg: dict[str, Any]) -> Path:
         headers_cfg = (
@@ -1446,7 +1458,7 @@ class PPOExecutor(TrainingMixin, Executor):
             output_dir: str | None = None, _internal_call: bool = False
         ) -> None:
             backup_model = ppo_trainer.model
-            backup_deepspeed: DeepSpeedEngine | None = None
+            backup_deepspeed: Any = None
             ppo_trainer.model = self._resolve_model_for_save(backup_model)
             if ppo_trainer.is_deepspeed_enabled:
                 backup_deepspeed = ppo_trainer.deepspeed

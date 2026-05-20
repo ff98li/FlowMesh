@@ -21,6 +21,7 @@ from typing import Any
 
 import psutil
 
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks.worker_message import WorkerHardware
 from worker.config import WorkerConfig
 
@@ -439,7 +440,7 @@ class MPExecutor(Executor):
         self._log_thread = t
         t.start()
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
+    def run(self, task: ExecutorTask, out_dir: Path) -> BaseExecutorResult:
         with self._lock:
             if self._shutdown:
                 logger.info("Starting worker subprocess for %s", self.name)

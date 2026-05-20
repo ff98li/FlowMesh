@@ -2,19 +2,23 @@
 Executor base class and a minimal example implementation.
 
 Usage:
-    from executor_base import Executor, ExecutionError, EchoExecutor
+    from shared.schemas.result import BaseExecutorResult
+    from worker.executors.base_executor import Executor, ExecutionError
+
+    class MyResult(BaseExecutorResult):
+        echo: str
 
     class MyExecutor(Executor):
         name = "my-executor"
-        def run(self, task: ExecutorTask, out_dir: Path) -> dict:
+        def run(self, task: ExecutorTask, out_dir: Path) -> MyResult:
             # ... your logic ...
-            return {"ok": True, "echo": task.task_id}
+            return MyResult(echo=task.task_id)
 
 Contract:
-- Implement `run(task: ExecutorTask, out_dir: Path) -> dict`. The runner
-  writes the returned dict to `out_dir/results.json` and injects the
-  top-level `_artifacts` context — executors should not write that file
-  themselves on the success path.
+- Implement `run(task: ExecutorTask, out_dir: Path) -> BaseExecutorResult`.
+  The runner writes the returned model to `out_dir/results.json` and
+  injects the top-level `_artifacts` context — executors should not write
+  that file themselves on the success path.
 - Drop generated files under `out_dir/artifacts/` (uploaded to the server
   when the task has an HTTP destination) or `scratch_dir(out_dir)` for
   local-only scratch data.
@@ -27,6 +31,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, TypeVar
 
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks import MergedChildTaskStrict
 from shared.tasks.specs import TaskSpecStrictBase
 from shared.tasks.worker_message import WorkerHardware, WorkerTaskMessage
@@ -84,7 +89,7 @@ class Executor(ABC):
         return None
 
     @abstractmethod
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
+    def run(self, task: ExecutorTask, out_dir: Path) -> BaseExecutorResult:
         """Execute a single task.
 
         Args:
@@ -93,7 +98,7 @@ class Executor(ABC):
             if needed.
 
         Returns:
-            A JSON-serializable dictionary summarizing the result.
+            A ``BaseExecutorResult`` subclass instance.
 
         Raises:
             ExecutionError: for expected, user-facing failures.
@@ -139,13 +144,19 @@ class Executor(ABC):
 
 
 # -------- Minimal example implementation --------
+class EchoResult(BaseExecutorResult):
+    ok: bool = True
+    executor: str
+    task_id: str
+    task_type: str
+
+
 class EchoExecutor(Executor):
     name = "echo"
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "executor": self.name,
-            "task_id": task.task_id,
-            "task_type": task.spec.taskType,
-        }
+    def run(self, task: ExecutorTask, out_dir: Path) -> EchoResult:
+        return EchoResult(
+            executor=self.name,
+            task_id=task.task_id,
+            task_type=task.spec.taskType,
+        )

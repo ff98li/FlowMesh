@@ -50,22 +50,33 @@ except Exception:
         current_omni_platform = None
     _HAS_OMNI_PLATFORM = False
 
+from shared.schemas.artifact import ArtifactRef
 from shared.schemas.governance import SpanType
 from shared.tasks.specs import TaskSpecStrictBase
 from shared.tasks.specs.omni import OmniText2AudioSpecStrict
 from shared.utils.parsing import to_float, to_int
 
 from .base_executor import ExecutionError, ExecutorTask
-from .omni_executor_base import OmniExecutorBase, extract_multimodal_output
-from .utils.checkpoints import artifact_ref
+from .omni_executor_base import OmniExecutorBase, OmniResult, extract_multimodal_output
 
 logger = logging.getLogger(__name__)
+EXECUTOR_NAME = "omni_text2audio"
+
+
+class OmniText2AudioResult(OmniResult):
+    executor: str = EXECUTOR_NAME
+    mode: str = "bgm"
+    audio: ArtifactRef | None
+    sample_rate: int
+    num_waveforms: int
+    audio_length: float
+    storyboard: dict[str, Any] | None = None
 
 
 class OmniText2AudioExecutor(OmniExecutorBase):
     """Generate background music with Omni diffusion sampling."""
 
-    name = "omni_text2audio"
+    name = EXECUTOR_NAME
     _TASK_SPEC_TYPE = OmniText2AudioSpecStrict
 
     def prepare(self) -> None:
@@ -84,7 +95,7 @@ class OmniText2AudioExecutor(OmniExecutorBase):
         spec: TaskSpecStrictBase,
         spec_dict: dict[str, Any],
         out_dir: Path,
-    ) -> dict[str, Any]:
+    ) -> OmniText2AudioResult:
         assert isinstance(spec, OmniText2AudioSpecStrict)
         prompts = self._collect_text_inputs(spec, task.task_id)
 
@@ -192,8 +203,8 @@ class OmniText2AudioExecutor(OmniExecutorBase):
                             "prompt_index": prompt_idx,
                             "waveform_index": local_idx,
                             "prompt": prompt,
-                            "audio": artifact_ref(
-                                self.relative_to(save_path, artifacts_dir)
+                            "audio": ArtifactRef(
+                                path=self.relative_to(save_path, artifacts_dir)
                             ),
                         }
                     )
@@ -202,22 +213,15 @@ class OmniText2AudioExecutor(OmniExecutorBase):
         if not items:
             raise ExecutionError("omni_text2audio produced no savable waveforms.")
 
-        first = items[0]["audio"] if items else {}
-        result: dict[str, Any] = {
-            "ok": True,
-            "executor": self.name,
-            "mode": "bgm",
-            "model": self._model_name,
-            "audio": first,
-            "items": items,
-            "sample_rate": sample_rate,
-            "num_waveforms": len(items),
-            "audio_length": audio_length,
-        }
-        storyboard = spec_dict.get("storyboard")
-        if isinstance(storyboard, dict):
-            result["storyboard"] = dict(storyboard)
-        return result
+        return OmniText2AudioResult(
+            model=self._model_name,
+            audio=items[0]["audio"] if items else None,
+            items=items,
+            sample_rate=sample_rate,
+            num_waveforms=len(items),
+            audio_length=audio_length,
+            storyboard=spec_dict.get("storyboard"),
+        )
 
     # ── model ────────────────────────────────────────────────────────────
 

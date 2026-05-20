@@ -14,16 +14,14 @@ from typing import TYPE_CHECKING, Any
 
 from PIL import Image
 
+from shared.schemas.artifact import ArtifactRef
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks.specs import DiffusionSpecStrict
 
 from ..utils.logging import configure_hf_library_logging
 from .base_executor import ExecutionError, Executor, ExecutorTask
 from .mixins.data import DataMixin
-from .utils.checkpoints import (
-    artifact_ref,
-    maybe_upload_artifacts,
-    maybe_upload_traces,
-)
+from .utils.checkpoints import maybe_upload_artifacts, maybe_upload_traces
 
 try:
     import torch
@@ -43,6 +41,12 @@ except Exception:
         _HAS_DIFFUSERS = False
 
 logger = logging.getLogger(__name__)
+
+
+class DiffusersResult(BaseExecutorResult):
+    ok: bool = True
+    model: str | None = None
+    images: list[ArtifactRef] = []
 
 
 class DiffusersExecutor(DataMixin, Executor):
@@ -240,24 +244,24 @@ class DiffusersExecutor(DataMixin, Executor):
 
         return combined_pos, combined_neg, user_pos_pooled, user_neg_pooled
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
+    def run(self, task: ExecutorTask, out_dir: Path) -> DiffusersResult:
         configure_hf_library_logging()
         spec = self.require_spec(task, DiffusionSpecStrict)
         task_id = task.task_id.strip()
         with self._task_span(
             task_id, task.workflow_id, out_dir, owner_id=task.owner_id
         ):
-            response = self._run_inner(spec, task_id, out_dir)
+            result = self._run_inner(spec, task_id, out_dir)
         maybe_upload_artifacts(task, out_dir, logger=logger)
         maybe_upload_traces(task, out_dir, logger=logger)
-        return response
+        return result
 
     def _run_inner(
         self,
         spec: DiffusionSpecStrict,
         task_id: str,
         out_dir: Path,
-    ) -> dict[str, Any]:
+    ) -> DiffusersResult:
         self._ensure_pipeline(spec)
         assert self._pipe is not None
 
@@ -336,24 +340,18 @@ class DiffusersExecutor(DataMixin, Executor):
         image_dir = out_dir / "artifacts" / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
 
-        generated_images: list[dict[str, str]] = []
+        generated_images: list[ArtifactRef] = []
         for idx, img in enumerate(images):
             img.save(image_dir / f"image_{idx}.png", format="PNG")
-            generated_images.append(artifact_ref(f"images/image_{idx}.png"))
+            generated_images.append(ArtifactRef(path=f"images/image_{idx}.png"))
 
-        response: dict[str, Any] = {
-            "ok": True,
-            "model": self._model_name,
-            "images": generated_images,
-        }
-
+        result = DiffusersResult(model=self._model_name, images=generated_images)
         self._dump_to_governance(
             task_id=task_id,
-            result=response,
+            result=result,
             dependencies_by_task=dependencies_by_task,
         )
-
-        return response
+        return result
 
     def cleanup_after_run(self) -> None:
         if self._pipe is not None:

@@ -16,18 +16,29 @@ from urllib.parse import urlparse
 from datasets import load_dataset
 from qdrant_client import QdrantClient, models
 
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks.specs import RagSpecStrict
 
 from .base_executor import ExecutionError, Executor, ExecutorTask
 from .utils.graph_templates import Message, build_prompts_from_graph_template
 
 logger = logging.getLogger("worker.rag")
+EXECUTOR_NAME = "rag"
+
+
+class RAGResult(BaseExecutorResult):
+    executor: str = EXECUTOR_NAME
+    qdrant: dict[str, Any]
+    embedding: dict[str, Any]
+    search: dict[str, Any]
+    queries: list[dict[str, Any]] = []
+    usage: dict[str, Any] | None = None
 
 
 class RAGExecutor(Executor):
-    name = "rag"
+    name = EXECUTOR_NAME
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
+    def run(self, task: ExecutorTask, out_dir: Path) -> RAGResult:
         start_ts = time.time()
         spec = self.require_spec(task, RagSpecStrict)
 
@@ -180,22 +191,17 @@ class RAGExecutor(Executor):
                 }
             )
 
-        # Compose response
-        out: dict[str, Any] = {
-            "ok": True,
-            "executor": self.name,
-            "qdrant": {"collection": collection, "url": url},
-            "embedding": {"model": model_name},
-            "search": {"top_k": top_k},
-            "queries": results_per_query,
-            "usage": {
+        logger.info(
+            "RAG query completed queries=%d total_results=%d", len(queries), total_items
+        )
+        return RAGResult(
+            qdrant={"collection": collection, "url": url},
+            embedding={"model": model_name},
+            search={"top_k": top_k},
+            queries=results_per_query,
+            usage={
                 "latency_sec": round(time.time() - start_ts, 4),
                 "num_queries": len(queries),
                 "total_results": total_items,
             },
-        }
-
-        logger.info(
-            "RAG query completed queries=%d total_results=%d", len(queries), total_items
         )
-        return out

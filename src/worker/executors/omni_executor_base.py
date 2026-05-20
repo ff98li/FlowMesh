@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import yaml
 
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks.specs import TaskSpecStrictBase
 from shared.utils.parsing import to_bool, to_int
 
@@ -40,6 +41,13 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+class OmniResult(BaseExecutorResult):
+    executor: str
+    mode: str
+    model: str | None
+    items: list[dict[str, Any]]
+
+
 class OmniExecutorBase(InferenceMixin, Executor):
     """Shared base for Omni-family executors.
 
@@ -58,7 +66,7 @@ class OmniExecutorBase(InferenceMixin, Executor):
         self._omni_spec: tuple[Any, ...] | None = None
         self._stage_configs_tmp: Path | None = None
 
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:
+    def run(self, task: ExecutorTask, out_dir: Path) -> OmniResult:
         spec = self.require_spec(task, self._TASK_SPEC_TYPE)
         spec_dict = spec.model_dump(by_alias=True)
         out_dir = Path(out_dir).resolve()
@@ -77,7 +85,7 @@ class OmniExecutorBase(InferenceMixin, Executor):
         spec: TaskSpecStrictBase,
         spec_dict: dict[str, Any],
         out_dir: Path,
-    ) -> dict[str, Any]:
+    ) -> OmniResult:
         """Run the executor-specific body. ``spec`` is the concrete strict
         spec; subclasses ``assert isinstance(spec, ...)`` to narrow."""
         raise NotImplementedError

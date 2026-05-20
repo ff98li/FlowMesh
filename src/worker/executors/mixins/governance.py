@@ -18,6 +18,7 @@ from shared.schemas.governance import (
     TASK_SPAN_NAME,
     SpanType,
 )
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks.specs import TaskSpecStrictBase
 from shared.utils.time import now_iso
 
@@ -209,7 +210,9 @@ class GovernanceMixin:
         )
 
     @staticmethod
-    def _spec_upstream_results(spec: TaskSpecStrictBase) -> dict[str, Any]:
+    def _spec_upstream_results(
+        spec: TaskSpecStrictBase,
+    ) -> dict[str, BaseExecutorResult]:
         """Validated ``spec._upstreamResults`` (server-injected stage context)."""
         context = spec.upstreamResults or {}
         if not isinstance(context, dict):
@@ -236,27 +239,25 @@ class GovernanceMixin:
     def _dump_to_governance(
         self,
         task_id: str,
-        result: dict[str, Any],
+        result: BaseExecutorResult,
         dependencies_by_task: dict[str, list[str]],
     ) -> None:
         """Write parent + merged-child results and emit asset/lineage rows."""
         parent_deps = dependencies_by_task.get(task_id, [])
-        children_payload = result.get("children", {})
-
         collection_jobs: list[dict[str, Any]] = [
             {
                 "task_id": task_id,
-                "result": result,
+                "result": result.model_dump(),
                 "deps": parent_deps,
                 "is_parent": True,
             }
         ]
-        for child_id, child_result in children_payload.items():
+        for child_id, child_result in result.children.items():
             child_deps = dependencies_by_task.get(child_id, [])
             collection_jobs.append(
                 {
                     "task_id": child_id,
-                    "result": child_result,
+                    "result": child_result.model_dump(),
                     "deps": child_deps,
                     "is_parent": False,
                 }

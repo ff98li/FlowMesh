@@ -26,16 +26,22 @@ except Exception:
         Omni = None
     _HAS_OMNI = False
 
+from shared.schemas.artifact import ArtifactRef
 from shared.schemas.governance import SpanType
 from shared.tasks.specs import TaskSpecStrictBase
 from shared.tasks.specs.omni import OmniText2GeneralSpecStrict
 from shared.utils.parsing import as_list, to_bool, to_float, to_int, to_int_list
 
 from .base_executor import ExecutionError, ExecutorTask
-from .omni_executor_base import OmniExecutorBase, extract_audio_from_mm, save_audio
-from .utils.checkpoints import artifact_ref
+from .omni_executor_base import (
+    OmniExecutorBase,
+    OmniResult,
+    extract_audio_from_mm,
+    save_audio,
+)
 
 logger = logging.getLogger(__name__)
+EXECUTOR_NAME = "omni_text2general"
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are Qwen, a virtual human developed by the Qwen Team, "
@@ -44,10 +50,18 @@ _DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+class OmniText2GeneralResult(OmniResult):
+    executor: str = EXECUTOR_NAME
+    mode: str = "narration"
+    audio: ArtifactRef | None
+    sample_rate: int
+    storyboard: dict[str, Any] | None = None
+
+
 class OmniText2GeneralExecutor(OmniExecutorBase):
     """Generate narration/speech audio using Qwen3-Omni through vllm_omni.Omni."""
 
-    name = "omni_text2general"
+    name = EXECUTOR_NAME
     _TASK_SPEC_TYPE = OmniText2GeneralSpecStrict
 
     def prepare(self) -> None:
@@ -67,7 +81,7 @@ class OmniText2GeneralExecutor(OmniExecutorBase):
         spec: TaskSpecStrictBase,
         spec_dict: dict[str, Any],
         out_dir: Path,
-    ) -> dict[str, Any]:
+    ) -> OmniText2GeneralResult:
         assert isinstance(spec, OmniText2GeneralSpecStrict)
         texts = self._collect_text_inputs(spec, task.task_id)
 
@@ -170,27 +184,22 @@ class OmniText2GeneralExecutor(OmniExecutorBase):
                     "index": idx,
                     "request_id": rid,
                     "prompt": texts[idx] if idx < len(texts) else None,
-                    "audio": artifact_ref(self.relative_to(save_path, artifacts_dir)),
+                    "audio": ArtifactRef(
+                        path=self.relative_to(save_path, artifacts_dir)
+                    ),
                 }
                 text_out = text_results.get(rid)
                 if text_out:
                     item["text"] = text_out
                 items.append(item)
 
-        first = items[0]["audio"] if items else {}
-        result: dict[str, Any] = {
-            "ok": True,
-            "executor": self.name,
-            "mode": "narration",
-            "model": self._model_name,
-            "audio": first,
-            "items": items,
-            "sample_rate": sample_rate,
-        }
-        storyboard = spec_dict.get("storyboard")
-        if isinstance(storyboard, dict):
-            result["storyboard"] = dict(storyboard)
-        return result
+        return OmniText2GeneralResult(
+            model=self._model_name,
+            items=items,
+            audio=items[0]["audio"] if items else None,
+            sample_rate=sample_rate,
+            storyboard=spec_dict.get("storyboard"),
+        )
 
     # ── model ────────────────────────────────────────────────────────────
 

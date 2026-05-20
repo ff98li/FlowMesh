@@ -10,6 +10,7 @@ from typing import Any
 
 import requests
 
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks import MergedChildTaskStrict
 from shared.tasks.specs import InferenceSpecStrict, TaskSpecStrictBase
 from shared.tasks.worker_message import (
@@ -127,17 +128,14 @@ class Runner:
         spec: TaskSpecStrictBase,
         merged_children: list[MergedChildTaskStrict],
         out_dir: Path,
-        result: dict[str, Any] | None,
+        result: BaseExecutorResult | None,
     ):
         if result is None:
             return
         self._write_single_result(task_id, spec, out_dir, result)
 
         child_lookup = {entry.task_id: entry for entry in merged_children}
-        children_payload = (
-            result.get("children") if isinstance(result, dict) else {}
-        ) or {}
-        for child_id, child_result in children_payload.items():
+        for child_id, child_result in result.children.items():
             child_info = child_lookup.get(child_id)
             if child_info is None:
                 continue
@@ -151,7 +149,7 @@ class Runner:
         task_id: str,
         spec: TaskSpecStrictBase,
         out_dir: Path,
-        payload: dict[str, Any] | None,
+        payload: BaseExecutorResult | None,
     ):
         if payload is None:
             return
@@ -179,7 +177,7 @@ class Runner:
         time.sleep(delay)
 
     def _maybe_emit_http(
-        self, task_id: str, spec: TaskSpecStrictBase, result: dict[str, Any]
+        self, task_id: str, spec: TaskSpecStrictBase, result: BaseExecutorResult
     ) -> None:
         """Send task results to an HTTP endpoint when requested by the spec."""
         destination = get_http_destination(spec)
@@ -190,7 +188,7 @@ class Runner:
         ignore_error = destination.ignore_error
         payload = {
             "task_id": task_id,
-            "result": result,
+            "result": result.model_dump(),
             "worker_id": self.lifecycle.worker_id,
         }
         payload_size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))

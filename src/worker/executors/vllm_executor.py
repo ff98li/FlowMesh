@@ -67,6 +67,7 @@ except Exception:
         StructuredOutputsParams = None  # type: ignore
 
 from shared.schemas.governance import SpanType
+from shared.schemas.result import BaseExecutorResult
 from shared.tasks.specs import InferenceSpecStrict
 
 from .base_executor import ExecutionError, Executor, ExecutorTask
@@ -79,6 +80,13 @@ from .utils.checkpoints import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class VLLMResult(BaseExecutorResult):
+    ok: bool = True
+    model: str | None = None
+    items: list[dict[str, Any]] = []
+    usage: dict[str, Any] | None = None
 
 
 class _RawJsonSchema:
@@ -849,7 +857,7 @@ Summary:"""
     # --------------------------------------------------------------------- #
     # Execution
     # --------------------------------------------------------------------- #
-    def run(self, task: ExecutorTask, out_dir: Path) -> dict[str, Any]:  # type: ignore[override]
+    def run(self, task: ExecutorTask, out_dir: Path) -> VLLMResult:
         spec = self.require_spec(task, InferenceSpecStrict)
         task_id = task.task_id.strip()
         if not task_id:
@@ -868,7 +876,7 @@ Summary:"""
         task: ExecutorTask,
         spec: InferenceSpecStrict,
         out_dir: Path,
-    ) -> dict[str, Any]:
+    ) -> VLLMResult:
         task_id = task.task_id.strip()
         merge_children = task.merged_children or []
         entries: list[PreparedInferenceEntry] = []
@@ -1149,51 +1157,45 @@ Summary:"""
                 "num_requests": len(self._batched_inputs),
             }
 
-            result: dict[str, Any] = {
-                "ok": True,
-                "model": self._model_name,
-                "items": per_task_items.get(task_id, []),
-                "usage": parent_usage,
-            }
-
-            child_results: dict[str, Any] = {}
+            items = per_task_items.get(task_id, [])
+            child_results: dict[str, VLLMResult] = {}
             for child in merge_children:
                 child_id = child.task_id.strip()
                 if not child_id:
                     continue
-                child_payload: dict[str, Any] = {
-                    "items": per_task_items.get(child_id, []),
-                }
+                child_items = per_task_items.get(child_id, [])
                 maybe_usage = usage_by_task.get(child_id)
-                if maybe_usage:
-                    child_payload["usage"] = maybe_usage
-                child_results[child_id] = child_payload
+                child_results[child_id] = VLLMResult(
+                    model=self._model_name, items=child_items, usage=maybe_usage
+                )
 
             if parent_tables := parent_entry.tables:
-                result = self._populate_table(result, parent_tables)
+                items = self._populate_table(items, parent_tables)
             if child_results:
                 for child_id, child_payload in child_results.items():
                     if (child_entry := entry_by_task_id.get(child_id)) and (
                         child_tables := child_entry.tables
                     ):
-                        child_results[child_id] = self._populate_table(
-                            child_payload, child_tables
+                        child_results[child_id].items = self._populate_table(
+                            child_payload.items, child_tables
                         )
 
-            if child_results:
-                result["children"] = child_results
+        result = VLLMResult(
+            children=cast(dict[str, BaseExecutorResult], child_results),
+            model=self._model_name,
+            items=items,
+            usage=parent_usage,
+        )
 
         with self._span(
             "JSONL export",
             span_type=SpanType.COMPUTE,
             attributes={"task_ids": task_ids},
         ):
-            self._maybe_export_jsonl(spec, task_id, result, out_dir)
+            self._maybe_export_jsonl(spec, task_id, result.items, out_dir)
 
         self._dump_to_governance(
-            task_id=task_id,
-            result=result,
-            dependencies_by_task=dependencies_by_task,
+            task_id=task_id, result=result, dependencies_by_task=dependencies_by_task
         )
 
         return result
