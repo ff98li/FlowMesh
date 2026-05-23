@@ -4,6 +4,13 @@ import threading
 from collections.abc import Iterable
 from multiprocessing.queues import Queue as MPQueue
 
+# Shared multiprocessing context for FlowMesh child processes. Spawn (not fork) because
+# the parent opens Redis-over-TLS connections during lifespan startup, which initialises
+# OpenSSL state; OpenSSL is not fork-safe and the child can deadlock in
+# `ssl.SSLContext.__new__` when it builds its own connections. All IPC primitives shared
+# between parent and child must be created from this same context.
+MP_CTX = mp.get_context("spawn")
+
 type TaskIDType = str
 
 
@@ -90,8 +97,8 @@ class TaskReceiver[T, R]:
 
 
 def create_task_channel[T, R]() -> tuple[TaskSender[T, R], TaskReceiver[T, R]]:
-    send_q: MPQueue[tuple[TaskIDType, T | Sentinel]] = mp.Queue()
-    recv_q: MPQueue[tuple[TaskIDType, R | Sentinel]] = mp.Queue()
+    send_q: MPQueue[tuple[TaskIDType, T | Sentinel]] = MP_CTX.Queue()
+    recv_q: MPQueue[tuple[TaskIDType, R | Sentinel]] = MP_CTX.Queue()
     sender = TaskSender(send_q, recv_q)
     receiver = TaskReceiver(send_q, recv_q)
     return sender, receiver

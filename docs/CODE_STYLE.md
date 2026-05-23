@@ -117,6 +117,7 @@ as `--ignore-vuln` flags in `.github/workflows/security.yml`.
 | GHSA-w8v5-vhqr-4h9v | diskcache | (none) | upstream unmaintained, no fixed version published |
 | GHSA-j7w6-vpvq-j3gm | diffusers | 0.38.0 | fix requires safetensors>=0.8.0rc0 pre-release; uv lock won't pick up pre-releases without explicit opt-in |
 | GHSA-98h9-4798-4q5v | diffusers | 0.38.0 | same blocker as GHSA-j7w6-vpvq-j3gm — both fixed in 0.38.0 |
+| GHSA-7wx4-6vff-v64p | diffusers | 0.38.0 | same blocker as GHSA-j7w6-vpvq-j3gm — fixed in 0.38.0 |
 | PYSEC-2025-189 | torch | (none) | no fix version published |
 | PYSEC-2025-190 | torch | (none) | same |
 | PYSEC-2025-191 | torch | (none) | same |
@@ -141,6 +142,7 @@ as `--ignore-vuln` flags in `.github/workflows/security.yml`.
 | PYSEC-2024-277 | joblib | (none) | no fix version published |
 | PYSEC-2025-222 | vllm | (none) | no fix version published; held by vllm-omni 0.18 pin |
 | PYSEC-2024-274 | gradio | (none) | no fix version published; vllm-omni 0.18 pins gradio==5.50 |
+| PYSEC-2026-161 | starlette | 1.0.1 | gradio 5.50 caps starlette<1.0 (transitive via vllm-omni 0.18) |
 
 When a blocker lifts (e.g. transformers 5 ↔ vllm 0.19 line stabilizes),
 drop the corresponding `--ignore-vuln` flag from the workflow and the
