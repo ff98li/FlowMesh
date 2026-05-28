@@ -59,7 +59,17 @@ The hooks:
   tables so subsequent `PermissionChecker` calls have data to decide
   on. `RESULT` ownership is inferred from the owning task; `RESULT`
   permission checks are always paired with a `task_id`, and
-  workflow-level operations check `WORKFLOW`.
+  workflow-level operations check `WORKFLOW`. At startup the server
+  runs a reconcile sweep — after plugins load, the system principal
+  resolves, and the supervisor handshake completes — enumerating
+  every live workflow, task, worker, and node and calling
+  `reconcile(resources, logger)` once per registrar with the full
+  batch. `reconcile` is atomic per the `lumid-hooks` contract: on
+  failure the registrar's store is unchanged, so the server logs
+  the exception and moves on without risk of a partial wipe.
+  Persistent registrars use this call to drop records for resources
+  the server no longer knows about — stateless registrars implement
+  it as a no-op.
 
 The shared protocols treat `kind` and `action` as plain strings —
 `lumid-hooks` does not enumerate kinds. FlowMesh layers the
@@ -133,6 +143,11 @@ flowmesh stack up
 Each subdirectory of `FLOWMESH_PLUGIN_DIR` is importable as a
 top-level module. The mount is read-only, so the plugin code is
 treated as static deployment artifact.
+
+For writable persistence, `FLOWMESH_PLUGIN_DATA_DIR` (default
+`./plugin-data`) is mounted read-write at `/app/plugin-data`. A path
+value is a host bind-mount (auto-created on `stack up`); a bare name
+is an external Docker volume of that name.
 
 This handles plugin **code** without rebuilding the server image.
 When that isn't enough, build a thin overlay on top of the prebuilt

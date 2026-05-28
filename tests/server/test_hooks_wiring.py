@@ -7,7 +7,7 @@ disconnected from a call site.
 """
 
 import logging
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -30,6 +30,7 @@ from server.auth.security import (
     authenticate_api_key,
     authenticate_connection,
     deregister_resource,
+    reconcile_resources,
     register_resource,
     require_permission,
     resolve_accessible_ids,
@@ -605,6 +606,7 @@ class _RecordingRegistrar:
     def __init__(self) -> None:
         self.registered: list[tuple[str, ResourceRef]] = []
         self.deregistered: list[tuple[str, ResourceRef]] = []
+        self.reconciled: list[list[ResourceRef]] = []
 
     async def register(
         self,
@@ -621,6 +623,13 @@ class _RecordingRegistrar:
         logger: logging.Logger,
     ) -> None:
         self.deregistered.append((principal.principal_id, resource))
+
+    async def reconcile(
+        self,
+        resources: Iterable[ResourceRef],
+        logger: logging.Logger,
+    ) -> None:
+        self.reconciled.append(list(resources))
 
 
 class TestResourceRegistrarComposition:
@@ -687,9 +696,56 @@ class TestResourceRegistrarComposition:
             async def deregister(self, *args: Any, **kwargs: Any) -> None:
                 return None
 
+            async def reconcile(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
         register(BaseBindings(resource_registrars=[_Boom()]))
 
         with pytest.raises(RuntimeError, match="plugin failure"):
             await register_resource(
                 principal, ResourceKind.WORKFLOW, "wfl-1", {}, logger
             )
+
+    @pytest.mark.anyio
+    async def test_reconcile_fans_out_with_full_batch(
+        self, logger: logging.Logger
+    ) -> None:
+        first = _RecordingRegistrar()
+        second = _RecordingRegistrar()
+        register(BaseBindings(resource_registrars=[first, second]))
+
+        refs = [
+            ResourceRef(kind=ResourceKind.WORKFLOW.value, id="wfl-1"),
+            ResourceRef(kind=ResourceKind.WORKER.value, id="wkr-1"),
+        ]
+        await reconcile_resources(refs, logger)
+
+        for r in (first, second):
+            assert r.reconciled == [refs]
+
+    @pytest.mark.anyio
+    async def test_reconcile_failure_is_logged_and_isolated(
+        self, logger: logging.Logger
+    ) -> None:
+        ok = _RecordingRegistrar()
+
+        class _FailingReconcile:
+            name = "failing"
+
+            async def register(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
+            async def deregister(self, *args: Any, **kwargs: Any) -> None:
+                return None
+
+            async def reconcile(self, *args: Any, **kwargs: Any) -> None:
+                raise RuntimeError("reconcile boom")
+
+        failing = _FailingReconcile()
+        register(BaseBindings(resource_registrars=[failing, ok]))
+
+        # Sweep does not raise — failure is logged and the OK registrar
+        # still runs.
+        await reconcile_resources([], logger)
+
+        assert ok.reconciled == [[]]

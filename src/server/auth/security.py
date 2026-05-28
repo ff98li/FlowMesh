@@ -17,7 +17,7 @@ helpers short-circuit to "no filter, no gate".
 """
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from fastapi import HTTPException, WebSocket, WebSocketException, status
@@ -205,3 +205,27 @@ async def deregister_resource(
     resource = ResourceRef(kind=resource_kind.value, id=resource_id)
     for registrar in RESOURCE_REGISTRARS:
         await registrar.deregister(principal, resource, logger)
+
+
+async def reconcile_resources(
+    resources: Iterable[ResourceRef],
+    logger: logging.Logger,
+) -> None:
+    """Tell every registered `ResourceRegistrar` to replace its stored live
+    set with `resources`.
+
+    Called once during startup reconcile with every live workflow / task /
+    node / worker. Each registrar's `reconcile` is atomic — on failure the
+    registrar's store is unchanged — so a raised exception is logged and
+    the sweep continues with the next registrar. The failing registrar
+    retries next boot.
+    """
+    refs = list(resources)
+    for registrar in RESOURCE_REGISTRARS:
+        try:
+            await registrar.reconcile(refs, logger)
+        except Exception:
+            logger.exception(
+                "ResourceRegistrar %s.reconcile failed; store left untouched.",
+                registrar.name,
+            )
