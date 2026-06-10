@@ -22,6 +22,8 @@ from .specs import (
     EchoSpecTemplate,
     EmbeddingSpecStrict,
     EmbeddingSpecTemplate,
+    ImageClassificationTrainingSpecStrict,
+    ImageClassificationTrainingSpecTemplate,
     InferenceSpecStrict,
     InferenceSpecTemplate,
     LoRASFTSpecStrict,
@@ -53,6 +55,7 @@ type TaskSpecStrict = Annotated[
     | LoRASFTSpecStrict
     | PPOSpecStrict
     | DPOSpecStrict
+    | ImageClassificationTrainingSpecStrict
     | EchoSpecStrict
     | AgentSpecStrict
     | DataProfilingSpecStrict
@@ -75,6 +78,7 @@ type TaskSpecTemplate = Annotated[
     | LoRASFTSpecTemplate
     | PPOSpecTemplate
     | DPOSpecTemplate
+    | ImageClassificationTrainingSpecTemplate
     | EchoSpecTemplate
     | AgentSpecTemplate
     | DataProfilingSpecTemplate

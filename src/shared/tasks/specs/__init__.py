@@ -35,6 +35,8 @@ from .ssh import SSHSpecStrict, SSHSpecTemplate
 from .training import (
     DPOSpecStrict,
     DPOSpecTemplate,
+    ImageClassificationTrainingSpecStrict,
+    ImageClassificationTrainingSpecTemplate,
     LoRASFTSpecStrict,
     LoRASFTSpecTemplate,
     PPOSpecStrict,
@@ -52,6 +54,8 @@ __all__ = [
     "DPOSpecTemplate",
     "DiffusionSpecStrict",
     "DiffusionSpecTemplate",
+    "ImageClassificationTrainingSpecStrict",
+    "ImageClassificationTrainingSpecTemplate",
     "InferenceSpecStrict",
     "InferenceSpecTemplate",
     "LoRASFTSpecStrict",
