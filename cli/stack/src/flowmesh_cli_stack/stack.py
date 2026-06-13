@@ -531,33 +531,87 @@ def down(
     logging.success("FlowMesh stack stopped.")
 
 
+STACK_SERVICES = ("server", "redis_control", "redis_telemetry")
+"""Compose services that can be restarted individually."""
+
+WORKER_MANAGING_SERVICES = ("server",)
+"""Services whose restart tears down the supervisor; drain workers first."""
+
+
 @app.command()
 def restart(
+    services: list[str] | None = typer.Argument(
+        None,
+        help=(
+            "Restart only these compose services in place (any of: "
+            f"{', '.join(STACK_SERVICES)}), leaving the rest of the stack "
+            "running. Omit to restart the whole stack."
+        ),
+    ),
     env_file: Path = typer.Option(
         DEFAULT_ENV_FILE, "--env-file", help="Env file for compose"
     ),
     image_tag: str | None = typer.Option(
         None, "--image-tag", help="Override FLOWMESH_VERSION"
     ),
+    pull: bool = typer.Option(
+        True, "--pull/--no-pull", help="Pull the target image before recreating."
+    ),
 ) -> None:
-    """Drain workers and restart the stack."""
-    logging.info("Draining workers...")
-    _drain_workers(env_file)
-    _compose(
-        ["down"],
-        env_file=env_file,
-        env=image_env_overrides(image_tag),
-        profile="root",
-    )
+    """Drain workers and restart the stack, or recreate specific services in place.
+
+    With one or more SERVICE arguments the stack is left running and only those services
+    are recreated; when any of them manages workers (the server / supervisor) its
+    workers are drained first so their in-flight tasks requeue onto other nodes.
+    """
+    if not services:
+        logging.info("Draining workers...")
+        _drain_workers(env_file)
+        _compose(
+            ["down"],
+            env_file=env_file,
+            env=image_env_overrides(image_tag),
+            profile="root",
+        )
+        profile = "root" if _node_role(env_file) == NodeRole.ROOT else None
+        _compose(
+            ["up", "-d", "--wait"],
+            env_file=env_file,
+            env=image_env_overrides(image_tag),
+            to_deploy=True,
+            profile=profile,
+        )
+        logging.success("FlowMesh stack is up.")
+        return
+
+    requested = list(dict.fromkeys(services))
+    unknown = [svc for svc in requested if svc not in STACK_SERVICES]
+    if unknown:
+        logging.error(
+            f"Unknown service(s): {', '.join(unknown)}. "
+            f"Known services: {', '.join(STACK_SERVICES)}."
+        )
+        raise typer.Exit(code=1)
+
+    if any(svc in WORKER_MANAGING_SERVICES for svc in requested):
+        logging.info("Draining workers...")
+        _drain_workers(env_file)
+
     profile = "root" if _node_role(env_file) == NodeRole.ROOT else None
+    up_args = ["up", "-d", "--no-deps", "--force-recreate", "--wait"]
+    if pull:
+        up_args += ["--pull", "always"]
+    up_args += requested
+    joined = ", ".join(requested)
+    logging.info(f"Recreating service(s): {joined}...")
     _compose(
-        ["up", "-d", "--wait"],
+        up_args,
         env_file=env_file,
         env=image_env_overrides(image_tag),
         to_deploy=True,
         profile=profile,
     )
-    logging.success("FlowMesh stack is up.")
+    logging.success(f"Service(s) restarted: {joined}.")
 
 
 @app.command()

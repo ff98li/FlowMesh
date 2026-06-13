@@ -5,7 +5,11 @@ import time
 
 from shared.schemas.event import TaskEvent, serialize_event
 
-from ..clients.redis import TASK_EVENT_CHANNEL, SyncRedisClient
+from ..clients.redis import (
+    TASK_EVENT_STREAM_KEY,
+    TASK_EVENT_STREAM_MAXLEN,
+    SyncRedisClient,
+)
 from ..dispatcher import Dispatcher
 from ..registries.worker import WorkerRegistry
 from ..task.runtime import TaskRuntime
@@ -24,15 +28,17 @@ class WorkerWatchdog:
         enabled: bool,
         check_interval: int,
         grace_seconds: int,
+        rehydration_grace_seconds: int = 0,
     ) -> None:
         self._redis = redis_client
         self._worker_registry = worker_registry
         self._runtime = runtime
         self._dispatcher = dispatcher
         self._logger = logger
-        self._enabled = bool(enabled)
-        self._check_interval = max(1, int(check_interval))
-        self._grace_seconds = max(0, int(grace_seconds))
+        self._enabled = enabled
+        self._check_interval = max(1, check_interval)
+        self._grace_seconds = max(0, grace_seconds)
+        self._rehydration_grace_seconds = max(0, rehydration_grace_seconds)
         self._lock = threading.RLock()
         self._dead_marks: set[str] = set()
         self._thread: threading.Thread | None = None
@@ -104,7 +110,14 @@ class WorkerWatchdog:
                     continue
 
                 first_seen = stale_since.setdefault(worker_id, now)
-                if now - first_seen < self._grace_seconds:
+                grace = self._grace_seconds
+                if self._rehydration_grace_seconds > grace and (
+                    self._runtime.has_rehydrated_in_flight(
+                        worker_id, self._rehydration_grace_seconds
+                    )
+                ):
+                    grace = self._rehydration_grace_seconds
+                if now - first_seen < grace:
                     continue
                 if worker_id in declared_dead:
                     continue
@@ -154,7 +167,11 @@ class WorkerWatchdog:
             )
             try:
                 event_payload = json.dumps(serialize_event(event), ensure_ascii=False)
-                self._redis.publish_telemetry(TASK_EVENT_CHANNEL, event_payload)
+                self._redis.xadd_telemetry(
+                    TASK_EVENT_STREAM_KEY,
+                    {"payload": event_payload},
+                    maxlen=TASK_EVENT_STREAM_MAXLEN,
+                )
             except Exception as exc:
                 self._logger.error(
                     "Failed to publish synthetic TASK_FAILED for %s "

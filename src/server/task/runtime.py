@@ -13,9 +13,10 @@ from shared.utils import new_workflow_id
 
 from ..hooks import SUPPLIER_RESOLVERS
 from ..registries.worker import Worker, WorkerRegistry
-from ..registries.workflow import WorkflowRegistry
+from ..registries.workflow import PersistedTask, WorkflowRegistry, WorkflowSched
 from ..utils.time import parse_iso_ts
 from .models import (
+    TERMINAL_TASK_STATUSES,
     TaskInfo,
     TaskParsingResult,
     TaskRecord,
@@ -78,6 +79,7 @@ class TaskRuntime:
         self._workflow_epoch_frontier: dict[str, int] = {}
         self._workflow_in_epoch_order: dict[str, bool] = {}
         self._task_epoch_index: dict[str, int] = {}
+        self._rehydrated_dispatched: dict[str, float] = {}
 
         self._lock = threading.RLock()
         self._cv = threading.Condition(self._lock)
@@ -218,6 +220,19 @@ class TaskRuntime:
 
         await self._workflow_registry.register_workflow_async(workflow_id, task_records)
 
+        with self._cv:
+            persisted = [
+                item
+                for record in task_records
+                if (item := self._persisted_task_locked(record.task_id))
+            ]
+            in_epoch_order = self._workflow_in_epoch_order.get(workflow_id, False)
+            frontier = self._workflow_epoch_frontier.get(workflow_id, 0)
+        await self._workflow_registry.save_task_states_async(persisted)
+        await self._workflow_registry.save_workflow_sched_async(
+            workflow_id, in_epoch_order, frontier
+        )
+
         new_ready = False
         with self._cv:
             for task_id in candidate_ready:
@@ -232,6 +247,199 @@ class TaskRuntime:
                 self._cv.notify_all()
 
         return workflow_id, results
+
+    # ------------------------------------------------------------------ #
+    # Rehydration
+    # ------------------------------------------------------------------ #
+
+    async def rehydrate(self) -> int:
+        """Rebuild in-memory scheduler state from durable Redis records.
+
+        Reconstructs every live workflow's DAG, ready queue, and epoch state from the
+        persisted per-task snapshots. In-flight (DISPATCHED / CANCELLING) tasks are left
+        assigned to their worker: completions that landed during the restart arrive via
+        the replayed task-event stream, and genuinely departed workers are recovered by
+        the watchdog. Returns the number of workflows restored.
+        """
+        workflow_ids = await self._workflow_registry.get_workflow_ids_async()
+        rehydrated_at = time.time()
+        restored = 0
+        for workflow_id in sorted(workflow_ids):
+            wf_record = await self._workflow_registry.get_workflow_record_async(
+                workflow_id
+            )
+            if wf_record is None:
+                continue
+            tasks: list[PersistedTask] = [
+                state
+                for state in await self._workflow_registry.load_task_states_async(
+                    *wf_record.task_ids
+                )
+                if state
+            ]
+            if not tasks:
+                continue
+            sched = await self._workflow_registry.load_workflow_sched_async(workflow_id)
+            with self._cv:
+                self._install_rehydrated_workflow_locked(
+                    workflow_id, tasks, sched, rehydrated_at
+                )
+                self._cv.notify_all()
+            restored += 1
+        if restored:
+            self._logger.info("Rehydrated %d workflow(s) from durable state", restored)
+        return restored
+
+    def _install_rehydrated_workflow_locked(
+        self,
+        workflow_id: str,
+        tasks: list[PersistedTask],
+        sched: WorkflowSched | None,
+        rehydrated_at: float,
+    ) -> None:
+        terminal = TERMINAL_TASK_STATUSES
+        in_epoch_order = sched.in_epoch_order if sched else False
+        frontier = sched.epoch_frontier if sched else 0
+        epoch_members: dict[int, set[str]] = defaultdict(set)
+
+        for persisted in tasks:
+            record = persisted.record
+            task_id = record.task_id
+            self._tasks[task_id] = record
+            self._original_deps[task_id] = set(persisted.depends_on)
+            selected_worker_hint = (
+                record.selected_worker[0]
+                if record.selected_worker and len(record.selected_worker) == 1
+                else None
+            )
+            self._merge_key_by_task[task_id] = (record.merge_key, selected_worker_hint)
+            if persisted.epoch_index is not None:
+                self._task_epoch_index[task_id] = persisted.epoch_index
+                epoch_members[persisted.epoch_index].add(task_id)
+            if record.status == TaskStatus.DONE:
+                self._completed.add(task_id)
+            elif record.status == TaskStatus.FAILED:
+                self._failed.add(task_id)
+            elif record.status in (TaskStatus.DISPATCHED, TaskStatus.CANCELLING):
+                self._rehydrated_dispatched[task_id] = rehydrated_at
+
+        for persisted in tasks:
+            record = persisted.record
+            task_id = record.task_id
+            original = self._original_deps.get(task_id) or set()
+            for dep in original:
+                self._dependents[dep].add(task_id)
+            if record.status in terminal:
+                continue
+            # Only completed deps are subtracted, not failed ones: a failure
+            # cascade-fails its dependents and persists them FAILED atomically,
+            # so a non-terminal task here never has a FAILED dep to clear.
+            self._pending_deps[task_id] = {
+                dep for dep in original if dep not in self._completed
+            }
+
+        if in_epoch_order:
+            self._workflow_in_epoch_order[workflow_id] = True
+            self._ready_by_workflow.setdefault(workflow_id, [])
+        if epoch_members:
+            epoch_queue: deque[set[str]] = deque(
+                epoch_members[idx] for idx in sorted(epoch_members) if idx >= frontier
+            )
+            if epoch_queue:
+                self._workflow_epoch_tasks[workflow_id] = epoch_queue
+                self._workflow_epoch_frontier[workflow_id] = frontier
+
+        for persisted in tasks:
+            record = persisted.record
+            if record.status != TaskStatus.PENDING:
+                continue
+            if self._pending_deps.get(record.task_id):
+                continue
+            self._enqueue_ready_locked(record.task_id)
+
+    # ------------------------------------------------------------------ #
+    # Durable state persistence
+    # ------------------------------------------------------------------ #
+
+    def _persisted_task_locked(self, task_id: str) -> PersistedTask | None:
+        record = self._tasks.get(task_id)
+        if record is None:
+            return None
+        return PersistedTask(
+            record=record,
+            depends_on=self._original_deps.get(task_id) or set(),
+            epoch_index=self._task_epoch_index.get(task_id),
+        )
+
+    def _persist_locked(self, *task_ids: str) -> None:
+        items = [
+            persisted
+            for task_id in dict.fromkeys(task_ids)
+            if (persisted := self._persisted_task_locked(task_id))
+        ]
+        if items:
+            self._workflow_registry.save_task_states(items)
+
+    def _persist_sched_locked(self, workflow_id: str) -> None:
+        self._workflow_registry.save_workflow_sched(
+            workflow_id,
+            self._workflow_in_epoch_order.get(workflow_id, False),
+            self._workflow_epoch_frontier.get(workflow_id, 0),
+        )
+
+    def _persist_terminal_locked(self, *task_ids: str) -> None:
+        """Persist each task's final state — its record and its done/failed/cancelled
+        set membership (by current status) — as the single last step of a transition.
+
+        Persisting only after all in-memory mutations means a failed write can't leave
+        the in-memory state half-applied; the error propagates and the at-least-once
+        replay re-persists via ``_repersist_terminal_workflow_locked``. This assumes
+        the in-memory mutations never raise, which holds while ordered tasks carry
+        ``position_in_epoch`` (so the ready-queue helpers never hit their guards).
+        """
+        workflow_terminal_tasks: dict[str, tuple[list[str], list[str], list[str]]] = (
+            defaultdict(lambda: ([], [], []))
+        )
+        for task_id in dict.fromkeys(task_ids):
+            record = self._tasks.get(task_id)
+            if record is None:
+                continue
+            workflow_id = record.workflow_id
+            match record.status:
+                case TaskStatus.DONE:
+                    workflow_terminal_tasks[workflow_id][0].append(task_id)
+                case TaskStatus.FAILED:
+                    workflow_terminal_tasks[workflow_id][1].append(task_id)
+                case TaskStatus.CANCELLED:
+                    workflow_terminal_tasks[workflow_id][2].append(task_id)
+        for workflow_id, (done, failed, cancelled) in workflow_terminal_tasks.items():
+            if done:
+                self._workflow_registry.mark_task_done(workflow_id, *done)
+            if failed:
+                self._workflow_registry.mark_task_failed(workflow_id, *failed)
+            if cancelled:
+                self._workflow_registry.mark_task_cancelled(workflow_id, *cancelled)
+        self._persist_locked(*task_ids)
+
+    def _repersist_terminal_workflow_locked(self, workflow_id: str) -> None:
+        """Re-persist the workflow's already-terminal tasks and schedule state.
+
+        The idempotency guard calls this on a replayed terminal event: the original
+        transition may have failed its persist after committing in memory, so
+        re-persisting makes the durable state current before the consumer's cursor
+        advances past the event (else the task re-runs after a restart). It covers the
+        whole workflow, not just the replayed task, because a cascade's other affected
+        tasks aren't identifiable here. Idempotent; only on a rare duplicate replay.
+        """
+        terminal_ids = [
+            task_id
+            for task_id, record in self._tasks.items()
+            if record.workflow_id == workflow_id
+            and record.status in TERMINAL_TASK_STATUSES
+        ]
+        if terminal_ids:
+            self._persist_terminal_locked(*terminal_ids)
+        self._persist_sched_locked(workflow_id)
 
     # ------------------------------------------------------------------ #
     # Ready queue helpers
@@ -417,7 +625,6 @@ class TaskRuntime:
                 self._merge_key_by_task.pop(task_id, None)
                 self._merge_parent_map.pop(task_id, None)
                 self._merge_children_map.pop(task_id, None)
-                self._workflow_registry.mark_task_failed(workflow_id, task_id)
                 impacted.append((task_id, reason))
 
         return impacted
@@ -460,6 +667,7 @@ class TaskRuntime:
                         record.attempts = record.attempts + 1
                 except Exception:
                     record.attempts = (record.attempts or 0) + 1
+            self._persist_locked(task_id)
 
     def requeue(self, task_id: str, *, front: bool = False) -> bool:
         """Reinsert a task into the ready queue."""
@@ -531,6 +739,7 @@ class TaskRuntime:
                 sibling_record.assigned_worker = None
                 sibling_record.merge_slice = None
         self._workflow_registry.mark_task_dispatched(record.workflow_id, *siblings)
+        self._persist_locked(task_id, *siblings)
 
         return siblings
 
@@ -544,6 +753,7 @@ class TaskRuntime:
             parent = self._tasks.get(task_id)
             if parent:
                 parent.merged_children = None
+            self._persist_locked(task_id)
             return
         parent = self._tasks.get(task_id)
         if parent:
@@ -563,6 +773,7 @@ class TaskRuntime:
             else:
                 self._remove_from_ready_locked(child_id)
                 self._enqueue_ready_locked(child_id, front=True)
+        self._persist_locked(task_id, *children)
         self._cv.notify_all()
 
     def _finalize_merged_child_success(
@@ -595,7 +806,6 @@ class TaskRuntime:
         self._merge_key_by_task.pop(child_id, None)
         self._remove_from_ready_locked(child_id)
         self._merge_bucket_remove(child_id)
-        self._workflow_registry.mark_task_done(child_record.workflow_id, child_id)
         dependents = list(self._dependents.pop(child_id, set()))
         for dep_id in dependents:
             pending = self._pending_deps.get(dep_id)
@@ -638,7 +848,6 @@ class TaskRuntime:
         self._merge_key_by_task.pop(child_id, None)
         self._remove_from_ready_locked(child_id)
         self._merge_bucket_remove(child_id)
-        self._workflow_registry.mark_task_failed(child_record.workflow_id, child_id)
 
         dependents = list(self._dependents.pop(child_id, set()))
         for dep_id in dependents:
@@ -655,7 +864,6 @@ class TaskRuntime:
             dep_record.finished_ts = time.time()
             self._pending_deps.pop(dep_id, None)
             self._remove_from_ready_locked(dep_id)
-            self._workflow_registry.mark_task_failed(dep_record.workflow_id, dep_id)
             impacted.append((dep_id, fail_reason))
         return impacted
 
@@ -674,6 +882,9 @@ class TaskRuntime:
             record = self._tasks.get(task_id)
             if not record:
                 return
+            if record.status in TERMINAL_TASK_STATUSES:
+                # A replayed or late dispatch must not regress a terminal task.
+                return
             record.status = TaskStatus.DISPATCHED
             record.assigned_worker = worker.id
             record.topic = "tasks"
@@ -683,6 +894,7 @@ class TaskRuntime:
             self._workflow_registry.mark_task_dispatched(record.workflow_id, task_id)
             self._remove_from_ready_locked(task_id)
             self._merge_bucket_remove(task_id)
+            self._persist_locked(task_id)
 
     def mark_started(
         self,
@@ -696,17 +908,24 @@ class TaskRuntime:
             record = self._tasks.get(task_id)
             if not record:
                 return
+            if record.status in TERMINAL_TASK_STATUSES:
+                # A replayed or late start must not regress a terminal task.
+                return
             record.status = TaskStatus.DISPATCHED
             record.started_ts = started_ts
             if worker_id:
                 record.assigned_worker = worker_id
             self._workflow_registry.mark_task_dispatched(record.workflow_id, task_id)
+            self._persist_locked(task_id)
 
     def mark_updated(self, task_id: str, payload: dict[str, Any]) -> None:
         with self._lock:
             record = self._tasks.get(task_id)
-            if record is not None:
-                record.latest_update = payload
+            if record is None or record.status in TERMINAL_TASK_STATUSES:
+                # A replayed or late progress update must not touch a terminal task.
+                return
+            record.latest_update = payload
+            self._persist_locked(task_id)
 
     def mark_succeeded(
         self,
@@ -733,6 +952,18 @@ class TaskRuntime:
             if record:
                 if record.status == TaskStatus.CANCELLED:
                     return usages
+                if record.status == TaskStatus.DONE:
+                    # Idempotent: a replayed TASK_SUCCEEDED must not re-apply, but
+                    # re-persist in case the original completion's write failed
+                    # after its in-memory commit.
+                    self._repersist_terminal_workflow_locked(record.workflow_id)
+                    return []
+                if record.status == TaskStatus.FAILED:
+                    self._logger.warning(
+                        "Ignoring TASK_SUCCEEDED for task %s in terminal status FAILED",
+                        task_id,
+                    )
+                    return []
                 record.status = TaskStatus.DONE
                 record.error = None
                 record.finished_ts = finished_ts
@@ -743,7 +974,6 @@ class TaskRuntime:
                 record.merged_children = None
                 if usage is not None:
                     record.usages.append(usage)
-                self._workflow_registry.mark_task_done(record.workflow_id, task_id)
 
             self._completed.add(task_id)
             self._failed.discard(task_id)
@@ -780,6 +1010,10 @@ class TaskRuntime:
                     self._try_advance_epoch_frontier_locked(record.workflow_id)
                 )
 
+            self._persist_terminal_locked(task_id, *merged_children_ids)
+            if record is not None:
+                self._persist_sched_locked(record.workflow_id)
+
             if ready_children:
                 self._cv.notify_all()
 
@@ -815,6 +1049,18 @@ class TaskRuntime:
             if record:
                 if record.status == TaskStatus.CANCELLED:
                     return [], [], usages
+                if record.status == TaskStatus.FAILED:
+                    # Idempotent: a replayed TASK_FAILED must not re-apply, but
+                    # re-persist in case the original failure's write (including
+                    # its cascade) failed after the in-memory commit.
+                    self._repersist_terminal_workflow_locked(record.workflow_id)
+                    return [], [], []
+                if record.status == TaskStatus.DONE:
+                    self._logger.warning(
+                        "Ignoring TASK_FAILED for task %s in terminal status DONE",
+                        task_id,
+                    )
+                    return [], [], []
                 record.status = TaskStatus.FAILED
                 record.error = message
                 record.finished_ts = finished_ts
@@ -825,7 +1071,6 @@ class TaskRuntime:
                 record.merged_children = None
                 if usage is not None:
                     record.usages.append(usage)
-                self._workflow_registry.mark_task_failed(record.workflow_id, task_id)
 
             self._failed.add(task_id)
             self._completed.discard(task_id)
@@ -850,9 +1095,6 @@ class TaskRuntime:
                 child_record.finished_ts = time.time()
                 self._pending_deps.pop(child, None)
                 self._remove_from_ready_locked(child)
-                self._workflow_registry.mark_task_failed(
-                    child_record.workflow_id, child
-                )
                 impacted.append((child, reason))
 
             for merged_child in merged_children_ids:
@@ -876,6 +1118,12 @@ class TaskRuntime:
                     )
                 )
 
+            self._persist_terminal_locked(
+                task_id, *merged_children_ids, *(dep_id for dep_id, _ in impacted)
+            )
+            if record is not None:
+                self._persist_sched_locked(record.workflow_id)
+
             return impacted, merged_children_ids, usages
 
     # ------------------------------------------------------------------ #
@@ -884,16 +1132,16 @@ class TaskRuntime:
 
     def cancel_workflow(self, workflow_id: str, reason: str = "cancelled") -> list[str]:
         cancelled: list[str] = []
+        cancelling: list[str] = []
+        touched: list[str] = []
         interrupts: list[InterruptMessage] = []
         with self._cv:
-            workflow_task_ids = [
-                task_id
-                for task_id, record in self._tasks.items()
-                if record.workflow_id == workflow_id
+            workflow_tasks = [
+                item
+                for item in self._tasks.items()
+                if item[1].workflow_id == workflow_id
             ]
-            for task_id, record in list(self._tasks.items()):
-                if record.workflow_id != workflow_id:
-                    continue
+            for task_id, record in workflow_tasks:
                 match record.status:
                     case TaskStatus.PENDING if not self._parent_is_active(task_id):
                         record.status = TaskStatus.CANCELLED
@@ -910,6 +1158,8 @@ class TaskRuntime:
                         self._merge_key_by_task.pop(task_id, None)
                         self._merge_parent_map.pop(task_id, None)
                         self._merge_children_map.pop(task_id, None)
+                        cancelled.append(task_id)
+                        touched.append(task_id)
                     case TaskStatus.DISPATCHED if (
                         not self._parent_is_active(task_id)
                         and not record.merged_children
@@ -924,20 +1174,20 @@ class TaskRuntime:
                                 reason=reason,
                             )
                         )
+                        cancelling.append(task_id)
+                        touched.append(task_id)
                     case _:
                         continue
-                cancelled.append(task_id)
 
             self._workflow_epoch_tasks.pop(workflow_id, None)
             self._workflow_epoch_frontier.pop(workflow_id, None)
             self._workflow_in_epoch_order.pop(workflow_id, None)
-            for task_id in workflow_task_ids:
+            for task_id, _ in workflow_tasks:
                 self._task_epoch_index.pop(task_id, None)
+            self._persist_locked(*cancelling)
+            self._persist_terminal_locked(*cancelled)
+            self._persist_sched_locked(workflow_id)
 
-        for task_id in cancelled:
-            maybe_record = self._tasks.get(task_id)
-            if maybe_record and maybe_record.status == TaskStatus.CANCELLED:
-                self._workflow_registry.mark_task_cancelled(workflow_id, task_id)
         for interrupt in interrupts:
             worker = self._worker_registry.get_worker(interrupt.worker_id)
             if worker is None:
@@ -948,7 +1198,7 @@ class TaskRuntime:
                 )
             else:
                 self._worker_registry.publish_interrupt(worker, interrupt)
-        return cancelled
+        return touched
 
     def mark_cancelled(
         self, task_id: str, worker_id: str | None, payload: dict[str, Any], ts: str
@@ -966,6 +1216,17 @@ class TaskRuntime:
             if record is None:
                 return usages
             if record.status == TaskStatus.CANCELLED:
+                # Idempotent: a replayed cancellation must not re-apply, but
+                # re-persist in case the original cancellation's write failed
+                # after its in-memory commit.
+                self._repersist_terminal_workflow_locked(record.workflow_id)
+                return usages
+            if record.status in (TaskStatus.DONE, TaskStatus.FAILED):
+                self._logger.warning(
+                    "Ignoring cancellation for task %s in terminal status %s",
+                    task_id,
+                    record.status,
+                )
                 return usages
             record.status = TaskStatus.CANCELLED
             record.finished_ts = finished_ts
@@ -982,8 +1243,8 @@ class TaskRuntime:
             self._merge_bucket_remove(task_id)
             self._merge_key_by_task.pop(task_id, None)
             self._merge_children_map.pop(task_id, None)
-            self._workflow_registry.mark_task_cancelled(record.workflow_id, task_id)
             record.assigned_worker = None
+            self._persist_terminal_locked(task_id)
             return usages
 
     def get_record(self, task_id: str) -> TaskRecord | None:
@@ -1029,8 +1290,35 @@ class TaskRuntime:
                     continue
                 if record.status not in (TaskStatus.DISPATCHED, TaskStatus.CANCELLING):
                     continue
+                self._rehydrated_dispatched.pop(task_id, None)
                 recovered.append(task_id)
         return recovered
+
+    def has_rehydrated_in_flight(self, worker_id: str, within_sec: float) -> bool:
+        """
+        Whether ``worker_id`` still owns an in-flight task that was rehydrated within
+        the last ``within_sec`` seconds.
+
+        Worker heartbeats are dropped while the root is down, so a surviving worker
+        looks briefly stale right after a restart. The watchdog uses this to extend a
+        worker's death grace until its rehydrated tasks' window has elapsed, giving the
+        worker time to re-register before its tasks are reclaimed.
+        """
+        now = time.time()
+        with self._cv:
+            for task_id, rehydrated_at in list(self._rehydrated_dispatched.items()):
+                record = self._tasks.get(task_id)
+                if record is None or record.status not in (
+                    TaskStatus.DISPATCHED,
+                    TaskStatus.CANCELLING,
+                ):
+                    self._rehydrated_dispatched.pop(task_id, None)
+                    continue
+                if now - rehydrated_at >= within_sec:
+                    continue
+                if record.assigned_worker == worker_id:
+                    return True
+        return False
 
     def shutdown(self) -> None:
         with self._cv:

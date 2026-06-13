@@ -101,6 +101,29 @@ server connects to the root node's Redis via `REDIS_CONTROL_URL` and
 `REDIS_TELEMETRY_URL`, which must be set in the worker's `.env` to reachable
 endpoints on the root node.
 
+## Restarting services
+
+Recreate one or more Compose services in place, leaving the rest of the stack running:
+
+```bash
+flowmesh stack restart server                  # recreate the server in place
+flowmesh stack restart server --no-pull        # recreate without pulling a new image
+flowmesh stack restart redis_control server    # recreate several services in one call
+flowmesh stack restart                         # whole-stack drain + down + up (no service arg)
+```
+
+With one or more `SERVICE` arguments (`server`, `redis_control`,
+`redis_telemetry`) only those services are recreated (`--no-deps
+--force-recreate`), leaving the rest of the stack — including Redis — running.
+When any of them manages workers (the server / supervisor), its workers are
+drained first (once) so their in-flight tasks requeue onto other nodes; the
+server's healthcheck gates `--wait` until it is back and ready. With no
+argument the whole stack is restarted. To roll a new image across a cluster,
+recreate the server on each node in turn (root last) with `--image-tag` — see
+[`SERVICE_RESTARTS.md`](SERVICE_RESTARTS.md).
+
+## Building & pushing images
+
 After changing executor code, rebuild the affected image before bringing
 the stack back up — running containers don't pick up source changes:
 

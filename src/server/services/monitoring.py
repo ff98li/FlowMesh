@@ -25,7 +25,9 @@ from shared.utils.manifest import RESULTS_NAME, sync_manifest
 from ..auth import default_principal, deregister_resource, register_resource
 from ..clients.redis import (
     NODE_EVENT_CHANNEL,
-    TASK_EVENT_CHANNEL,
+    TASK_EVENT_CURSOR_KEY,
+    TASK_EVENT_STREAM_KEY,
+    TASK_EVENT_STREAM_MAXLEN,
     WORKER_EVENT_CHANNEL,
     SyncRedisClient,
     iter_pubsub_messages,
@@ -55,6 +57,17 @@ from ..utils.time import now_iso
 from .metrics import MetricsRecorder
 from .ssh_forward import SshForwardService
 from .watchdog import WorkerWatchdog
+
+TASK_EVENT_HANDLER_MAX_ATTEMPTS = 5
+
+
+def _stream_id_tuple(entry_id: str) -> tuple[int, int]:
+    """Parse a Redis stream id (``<ms>-<seq>``) into a comparable tuple."""
+    ms, _, seq = entry_id.partition("-")
+    try:
+        return int(ms), int(seq or 0)
+    except ValueError:
+        return 0, 0
 
 
 def failed_task_can_retry(record: TaskRecord | None, retryable: bool | None) -> bool:
@@ -104,6 +117,9 @@ class EventMonitor:
 
         self._pending_result_clones: dict[str, list[str]] = {}
         self._pending_lock = threading.RLock()
+
+        # Per-entry handler-failure counts backing the consumer's retry budget.
+        self._event_handler_attempts: dict[str, int] = {}
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._threads: list[threading.Thread] | None = None
@@ -249,19 +265,144 @@ class EventMonitor:
     # ------------------------------------------------------------------ #
 
     def _tasks_events_loop(self) -> None:
-        event_key = TASK_EVENT_CHANNEL
+        """Consume task events from a durable Redis stream.
+
+        Replay contract: a task transition is persisted to durable scheduler state
+        *before* its event is emitted, and the consumer advances the persisted cursor
+        only *after* an entry is handled. Delivery is therefore at-least-once — a crash
+        between handling an entry and persisting the cursor replays that entry on the
+        next startup. Event handlers are idempotent (terminal tasks ignore late
+        dispatch/start/update events and repeated completions), so replay never
+        double-applies.
+
+        Resuming from the persisted cursor is what lets events emitted while
+        the server was down (e.g. during a rolling restart) be replayed rather
+        than lost. The cursor is kept on the control Redis while the stream
+        lives on the telemetry Redis, so durable resume relies on both volumes
+        surviving — which the rolling-restart flow already requires.
+
+        The stream is length-bounded (``TASK_EVENT_STREAM_MAXLEN``), so a
+        consumer that stays down long enough for its cursor to fall behind the
+        trim horizon loses the events in between. That is detected and logged on
+        resume rather than passing silently.
+        """
+        cursor = self._redis_client.get(TASK_EVENT_CURSOR_KEY) or "0-0"
+        self._warn_if_cursor_trimmed(cursor)
         while not self._stop_event.is_set():
             try:
-                for event in self._get_event_stream(event_key):
-                    if isinstance(event, TaskEvent):
-                        self._handle_task_event(event)
+                rows = self._redis_client.xread_telemetry(
+                    {TASK_EVENT_STREAM_KEY: cursor}, count=200, block_ms=1000
+                )
             except Exception as exc:
                 if self._stop_event.is_set():
                     break
                 self._logger.warning(
-                    "%s listener error: %s; reconnecting...", event_key, exc
+                    "%s listener error: %s; reconnecting...", TASK_EVENT_STREAM_KEY, exc
                 )
                 time.sleep(2.0)
+                continue
+            for _, entries in rows:
+                cursor = self._consume_stream_batch(entries, cursor)
+                if self._stop_event.is_set():
+                    break
+
+    def _consume_stream_batch(
+        self, entries: list[tuple[str, dict[str, Any]]], cursor: str
+    ) -> str:
+        """Handle one batch of stream entries, advancing the cursor per entry.
+
+        Parse failures are skipped; handler failures are retried without advancing the
+        cursor, then dead-lettered after ``TASK_EVENT_HANDLER_MAX_ATTEMPTS`` attempts.
+        """
+        for entry_id, fields in entries:
+            try:
+                event = self._parse_stream_event(fields)
+            except Exception as exc:
+                self._logger.error(
+                    "Failed to parse task event %s; skipping malformed entry: %s",
+                    entry_id,
+                    exc,
+                )
+                self._event_handler_attempts.pop(entry_id, None)
+                cursor = self._advance_event_cursor(entry_id)
+                if self._stop_event.is_set():
+                    break
+                continue
+
+            if isinstance(event, TaskEvent):
+                try:
+                    self._handle_task_event(event)
+                except Exception as exc:
+                    # Don't advance past a handler failure: it may be transient,
+                    # and the watchdog only reclaims dead workers (not a task stuck
+                    # under a live one), so advancing would lose the transition.
+                    attempts = self._event_handler_attempts.get(entry_id, 0) + 1
+                    if attempts < TASK_EVENT_HANDLER_MAX_ATTEMPTS:
+                        self._event_handler_attempts[entry_id] = attempts
+                        self._logger.warning(
+                            "Failed to apply task event %s (attempt %d/%d); "
+                            "will retry: %s",
+                            entry_id,
+                            attempts,
+                            TASK_EVENT_HANDLER_MAX_ATTEMPTS,
+                            exc,
+                        )
+                        return cursor
+                    self._logger.error(
+                        "Dropping task event %s after %d failed attempts: %s",
+                        entry_id,
+                        attempts,
+                        exc,
+                    )
+                self._event_handler_attempts.pop(entry_id, None)
+
+            cursor = self._advance_event_cursor(entry_id)
+            if self._stop_event.is_set():
+                break
+        return cursor
+
+    def _advance_event_cursor(self, entry_id: str) -> str:
+        self._redis_client.set_value(TASK_EVENT_CURSOR_KEY, entry_id)
+        return entry_id
+
+    def _warn_if_cursor_trimmed(self, cursor: str) -> None:
+        """Log if the persisted cursor has fallen behind the stream's trim horizon.
+
+        Trimming removes entries from the front of the stream, so the oldest
+        surviving entry being newer than the cursor means every entry between
+        them was discarded before this consumer read it.
+        """
+        if cursor in ("$", "0", "0-0"):
+            return
+        try:
+            first = self._redis_client.xrange_telemetry(TASK_EVENT_STREAM_KEY, count=1)
+        except Exception as exc:
+            self._logger.debug(
+                "Could not inspect %s head: %s", TASK_EVENT_STREAM_KEY, exc
+            )
+            return
+        if not first:
+            return
+        first_id = first[0][0]
+        if _stream_id_tuple(first_id) > _stream_id_tuple(cursor):
+            self._logger.warning(
+                "%s cursor %s fell behind the stream head %s (maxlen=%d); "
+                "events in between were trimmed before they were consumed",
+                TASK_EVENT_STREAM_KEY,
+                cursor,
+                first_id,
+                TASK_EVENT_STREAM_MAXLEN,
+            )
+
+    def _parse_stream_event(self, fields: dict[str, Any]) -> Event | None:
+        raw = fields.get("payload")
+        if raw is None:
+            return None
+        try:
+            return parse_event(json.loads(raw))
+        except Exception as exc:
+            self._logger.debug("Failed to parse task stream event: %s (%s)", raw, exc)
+            return None
 
     def _handle_task_event(self, event: TaskEvent) -> None:
         payload = event.payload or {}

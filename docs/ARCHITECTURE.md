@@ -139,6 +139,15 @@ scripts/dev/            compile_protos, sync_requirements, check_env_examples
     `LOG_STREAM_MAXLEN_TASK` / `LOG_STREAM_MAXLEN_WORKFLOW` and
     expired `LOG_STREAM_TTL_SEC` after close.
 
+## Service restarts
+
+Any Compose service can be recreated in place with `flowmesh stack restart
+[SERVICE ...]`, without a full teardown. The root server survives its own
+restart without losing in-flight work: scheduling state is persisted to Redis
+and rebuilt on startup (`TaskRuntime.rehydrate`), and task events replay from a
+durable stream. Rolling a new image across the cluster one node at a time is one
+application. See [`SERVICE_RESTARTS.md`](SERVICE_RESTARTS.md).
+
 ## Plugin extension points
 
 Server extension points are loaded via the `FLOWMESH_PLUGINS` env var.
