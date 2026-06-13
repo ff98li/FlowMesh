@@ -568,6 +568,7 @@ class HFTransformersExecutor(InferenceMixin, Executor):
             raw_text = self._tok.decode(
                 gen_part, skip_special_tokens=skip_special_tokens
             )
+            assert isinstance(raw_text, str)
             text = raw_text
 
             # Apply simple stop-string truncation on decoded text
