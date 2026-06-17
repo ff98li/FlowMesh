@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from shared.schemas.worker import SSHLimits
+from shared.schemas.worker import SSHLimits, WorkerCapabilities
 from shared.tasks.worker_message import WorkerHardware, WorkerStatus
 from shared.utils.time import now_iso
 
@@ -75,6 +75,7 @@ class Lifecycle:
         self,
         env: dict[str, Any],
         hardware: WorkerHardware,
+        capabilities: WorkerCapabilities,
         ssh_limits: SSHLimits | None,
         tags: list[str],
     ):
@@ -89,6 +90,7 @@ class Lifecycle:
             pid=os.getpid(),
             env=env,
             hardware=hardware,
+            capabilities=capabilities,
             ssh_limits=ssh_limits,
             tags=tags,
             cost_per_hour=self.cost_per_hour,

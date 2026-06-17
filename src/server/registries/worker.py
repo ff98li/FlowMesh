@@ -9,7 +9,7 @@ from shared.schemas.command import (
     StopMessage,
     TaskMessage,
 )
-from shared.schemas.worker import SSHLimits
+from shared.schemas.worker import SSHLimits, WorkerCapabilities
 from shared.tasks import TaskEnvelope
 from shared.tasks.components.resources import GPURequirements
 from shared.tasks.specs import SSHSpecStrict, SSHSpecTemplate
@@ -54,6 +54,10 @@ class Worker(BaseModel):
     env: dict[str, Any] = Field(default_factory=dict, description="Runtime metadata.")
     hardware: WorkerHardware | None = Field(
         default=None, description="Hardware metadata."
+    )
+    capabilities: WorkerCapabilities = Field(
+        default_factory=WorkerCapabilities,
+        description="Task capabilities the worker advertises.",
     )
     ssh_limits: SSHLimits | None = Field(
         default=None, description="Configured ceiling on SSH session resources."
@@ -372,18 +376,18 @@ class WorkerRegistry:
                 continue
             if self.is_worker_stale(worker.id):
                 continue
-            if hw_satisfies(worker, task):
+            if hw_satisfies(worker, task) and capability_satisfies(worker, task):
                 available.append(worker)
         return self.sort_workers(available)
 
     def satisfying_workers(self, task: TaskEnvelope) -> list[Worker]:
-        """Non-stale workers whose hardware satisfies the task, any status."""
+        """Non-stale workers whose hardware and capabilities satisfy the task."""
         available: list[Worker] = []
         for worker_id in self.get_worker_ids():
             worker = self.get_worker(worker_id)
             if not worker or self.is_worker_stale(worker.id):
                 continue
-            if hw_satisfies(worker, task):
+            if hw_satisfies(worker, task) and capability_satisfies(worker, task):
                 available.append(worker)
         return self.sort_workers(available)
 
@@ -545,6 +549,12 @@ def hw_satisfies(worker: Worker, task: TaskEnvelope) -> bool:
     return True
 
 
+def capability_satisfies(worker: Worker, task: TaskEnvelope) -> bool:
+    if isinstance(task.spec, (SSHSpecStrict, SSHSpecTemplate)):
+        return worker.capabilities.ssh
+    return True
+
+
 def _gpu_meets_requirements(hw: WorkerHardware, gpu_req: GPURequirements) -> bool:
     required_count = gpu_req.count
     if required_count is not None:
@@ -642,6 +652,12 @@ def _parse_worker_from_redis(
         if hardware_json is None
         else WorkerHardware.model_validate_json(hardware_json)
     )
+    capabilities_json = value.get("capabilities_json")
+    capabilities = (
+        WorkerCapabilities()
+        if capabilities_json is None
+        else WorkerCapabilities.model_validate_json(capabilities_json)
+    )
     ssh_limits_json = value.get("ssh_limits_json")
     ssh_limits = (
         None
@@ -677,6 +693,7 @@ def _parse_worker_from_redis(
         pid=pid,
         env=env,
         hardware=hardware,
+        capabilities=capabilities,
         ssh_limits=ssh_limits,
         tags=tags,
         last_seen=value.get("last_seen"),

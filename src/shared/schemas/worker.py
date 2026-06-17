@@ -30,4 +30,12 @@ class SSHLimits(BaseModel):
     )
 
 
-__all__ = ["SSHLimits", "WorkerStatus"]
+class WorkerCapabilities(BaseModel):
+    """Task capabilities a worker advertises to the dispatcher."""
+
+    ssh: bool = Field(
+        default=False, description="Whether the worker can run SSH session tasks."
+    )
+
+
+__all__ = ["SSHLimits", "WorkerCapabilities", "WorkerStatus"]

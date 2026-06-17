@@ -79,6 +79,10 @@ class SSHLimits(BaseModel):
     max_pids: int | None = None
 
 
+class WorkerCapabilities(BaseModel):
+    ssh: bool = False
+
+
 class Worker(BaseModel):
     id: str
     alias: str | None = None
@@ -91,6 +95,7 @@ class Worker(BaseModel):
     pid: int | None = None
     env: dict[str, Any] = Field(default_factory=dict)
     hardware: WorkerHardware | None = None
+    capabilities: WorkerCapabilities = Field(default_factory=WorkerCapabilities)
     ssh_limits: SSHLimits | None = None
     tags: list[str] = Field(default_factory=list)
     last_seen: str | None = None

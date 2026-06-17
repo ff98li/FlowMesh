@@ -2,6 +2,7 @@ import argparse
 import logging
 import signal
 
+from shared.schemas.worker import WorkerCapabilities
 from shared.tasks.worker_message import WorkerHardware
 
 from .config import WorkerConfig
@@ -57,7 +58,7 @@ def initialize_executors(
     hardware: WorkerHardware,
     logger: logging.Logger,
     lifecycle: Lifecycle,
-    registry: dict[str, type | None] | None = None,
+    registry: dict[str, type[Executor] | None] | None = None,
     import_errors: dict[str, str] | None = None,
     cuda_available: bool | None = None,
     enable_mp_executors: bool = True,
@@ -93,6 +94,10 @@ def initialize_executors(
 
         if gpu_required and not check_cuda():
             logger.info("Executor %s requires a GPU; unavailable, skipping", key)
+            return None
+
+        if not cls.is_available(config):
+            logger.info("Executor %s is unavailable; skipping", key)
             return None
 
         try:
@@ -195,15 +200,6 @@ def main() -> None:
     )
     hardware = collect_hw(bandwidth_bytes_per_sec=cfg.network_bandwidth_bytes_per_sec)
     logger.info("Collected hardware info: %s", hardware)
-    ssh_limits = cfg.ssh_limits
-    if ssh_limits is None:
-        logger.warning(
-            "SSH resource cap not configured; SSH sessions will be able to access "
-            "full host resources of this worker."
-        )
-    else:
-        logger.info("SSH resource cap: %s", ssh_limits.model_dump())
-    lifecycle.start(env={}, hardware=hardware, ssh_limits=ssh_limits, tags=cfg.tags)
 
     executors, default_executor = initialize_executors(
         cfg,
@@ -211,6 +207,24 @@ def main() -> None:
         logger,
         lifecycle,
         enable_mp_executors=cfg.enable_mp_executors,
+    )
+
+    capabilities = WorkerCapabilities(ssh="ssh" in executors)
+    ssh_limits = cfg.ssh_limits
+    if capabilities.ssh:
+        if ssh_limits is None:
+            logger.warning(
+                "SSH resource cap not configured; SSH sessions will be able to access "
+                "full host resources of this worker."
+            )
+        else:
+            logger.info("SSH resource cap: %s", ssh_limits.model_dump())
+    lifecycle.start(
+        env={},
+        hardware=hardware,
+        capabilities=capabilities,
+        ssh_limits=ssh_limits,
+        tags=cfg.tags,
     )
 
     task_stream = supervisor_client.iter_tasks()

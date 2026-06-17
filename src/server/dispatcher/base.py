@@ -178,7 +178,8 @@ class Dispatcher:
                     task_id,
                     record,
                     reason="no_eligible_worker",
-                    message="No worker satisfies the task hardware requirements",
+                    message="No worker satisfies the task hardware and capability "
+                    "requirements",
                 )
             if not (eligible - failed_ids):
                 return self._grace_then_fail_exhausted(task_id, record, failed_ids)
