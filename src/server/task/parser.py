@@ -161,6 +161,10 @@ def _build_task_template(
             ) from exc
         raise ValueError(f"Invalid task payload{context}: {exc}") from exc
     _validate_ssh_access_mode(task, context)
+    try:
+        task.spec.validate_dispatchable()
+    except ValueError as exc:
+        raise ValueError(f"Invalid task payload{context}: {exc}") from exc
     return task
 
 
