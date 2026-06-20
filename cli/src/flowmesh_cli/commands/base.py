@@ -4,8 +4,9 @@ from pathlib import Path
 import typer
 from flowmesh.client import FlowMesh, resolve_config
 from flowmesh.config import DEFAULT_CONFIG_PATH, FlowMeshConfig
-from flowmesh.exceptions import FlowMeshError
+from flowmesh.exceptions import FlowMeshError, NotFoundError
 
+from .._version import __version__
 from ..core import logging
 from ..core.typer import get_typer
 
@@ -123,14 +124,23 @@ def config(
 
 @app.command()
 def info() -> None:
-    """Query server health status and basic system information."""
+    """Show client and server versions and server health."""
     client = FlowMesh()
     try:
-        resp = client.system.health()
+        health = client.system.health()
+        try:
+            server_version = client.system.version().version
+        except NotFoundError:
+            server_version = "unknown"
     except FlowMeshError as exc:
         logging.error(str(exc))
         raise typer.Exit(code=1)
-    logging.log(resp.model_dump_json(indent=2))
+    payload = {
+        "client_version": __version__,
+        "server_version": server_version,
+        "server_healthy": health.ok,
+    }
+    logging.log(json.dumps(payload, indent=2))
 
 
 @app.command()

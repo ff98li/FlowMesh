@@ -48,6 +48,7 @@ class Nodes(SyncResource):
         cluster: str,
         alias: str,
         started_at: str,
+        version: str | None = None,
         tags: builtins.list[str] | None = None,
         last_seen: str | None = None,
     ) -> NodeRegisterResponse:
@@ -60,6 +61,8 @@ class Nodes(SyncResource):
             "tags": tags or [],
             "last_seen": last_seen or started_at,
         }
+        if version is not None:
+            payload["version"] = version
         data = self._client._request("POST", "/nodes/register", json_body=payload)
         return NodeRegisterResponse.model_validate(data)
 
@@ -149,6 +152,7 @@ class AsyncNodes(AsyncResource):
         cluster: str,
         alias: str,
         started_at: str,
+        version: str | None = None,
         tags: builtins.list[str] | None = None,
         last_seen: str | None = None,
     ) -> NodeRegisterResponse:
@@ -161,6 +165,8 @@ class AsyncNodes(AsyncResource):
             "tags": tags or [],
             "last_seen": last_seen or started_at,
         }
+        if version is not None:
+            payload["version"] = version
         data = await self._client._request("POST", "/nodes/register", json_body=payload)
         return NodeRegisterResponse.model_validate(data)
 

@@ -18,6 +18,7 @@ class Node(BaseModel):
     namespace: str
     cluster: str
     alias: str
+    version: str | None = None
     started_at: str | None = None
     tags: list[str] = Field(default_factory=list)
     last_seen: str | None = None
@@ -50,5 +51,6 @@ class NodeWorkerInfo(BaseModel):
     node_id: str
     node_alias: str
     provider: str
+    version: str | None = None
     status: str
     hardware: WorkerHardware | None = None
