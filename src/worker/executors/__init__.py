@@ -100,7 +100,7 @@ EXECUTOR_CLASS_NAMES: dict[str, str] = {
     "omni_text2general": "OmniText2GeneralExecutor",
 }
 
-IMPORT_ERRORS: dict[str, str] = dict(_IMPORT_ERRORS)
+IMPORT_ERRORS: dict[str, str] = _IMPORT_ERRORS
 
 __all__ = [
     name
