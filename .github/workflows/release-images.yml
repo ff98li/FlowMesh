@@ -31,7 +31,7 @@ env:
 jobs:
   verify:
     name: Verify published images
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       is_release_tag: ${{ steps.check.outputs.is_release_tag }}
     steps:
@@ -52,7 +52,8 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
-          version: "0.11.8"
+          version: "0.11.26"
+          enable-cache: false
 
       - name: Install verification environment
         run: uv sync --all-packages --group dev --frozen
@@ -81,7 +82,7 @@ jobs:
     name: Retag images as :latest
     needs: verify
     if: needs.verify.outputs.is_release_tag == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     environment: ghcr
     permissions:
       contents: write  # gh release edit appends the digest table to the Release body.
@@ -96,7 +97,8 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
-          version: "0.11.8"
+          version: "0.11.26"
+          enable-cache: false
 
       - name: Install retag environment
         run: uv sync --all-packages --group dev --frozen
