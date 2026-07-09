@@ -8,36 +8,37 @@ from urllib.parse import urlparse, urlunparse
 
 import redis
 import redis.asyncio as async_redis
+import redis.exceptions
 from redis.asyncio.client import PubSub as AsyncPubSub
 from redis.asyncio.connection import SSLConnection as AsyncSSLConnection
 from redis.client import Pipeline, PubSub
 from redis.connection import SSLConnection as SyncSSLConnection
 from redis.typing import EncodableT
 
+# redis-py wraps dropped sockets in its own ConnectionError/TimeoutError, which
+# do NOT subclass the builtins; OSError covers raw socket failures. Loops that
+# read Redis must catch these to reconnect instead of dying.
+REDIS_CONN_ERRORS: tuple[type[BaseException], ...] = (
+    redis.exceptions.ConnectionError,
+    redis.exceptions.TimeoutError,
+    OSError,
+)
+
 
 def _keepalive_kwargs() -> dict[str, Any]:
     """Connection kwargs that keep an idle Redis socket alive.
 
-    A pub/sub SUBSCRIBE that receives no messages is an idle TCP connection.
-    Intermediaries (load balancers, NAT gateways) cull idle server-side
-    connections on their own timeout, silently dropping a node's dispatch
-    subscription so the publisher sees zero receivers. TCP keepalive probes
-    keep the connection observably alive well below such timeouts, and
-    ``health_check_interval`` makes the client re-establish a connection it
-    finds dead rather than blocking on a stale socket.
+    An idle pub/sub SUBSCRIBE gets culled by intermediaries (load balancers, NAT
+    gateways), dropping a node's dispatch subscription. Keepalive probes hold it open
+    and ``health_check_interval`` reconnects a dead socket instead of blocking on it.
     """
-    options: dict[int, int] = {}
-    for name, value in (
-        ("TCP_KEEPIDLE", 60),
-        ("TCP_KEEPINTVL", 15),
-        ("TCP_KEEPCNT", 4),
-    ):
-        opt = getattr(socket, name, None)
-        if opt is not None:
-            options[opt] = value
     return {
         "socket_keepalive": True,
-        "socket_keepalive_options": options,
+        "socket_keepalive_options": {
+            socket.TCP_KEEPIDLE: 60,
+            socket.TCP_KEEPINTVL: 15,
+            socket.TCP_KEEPCNT: 4,
+        },
         "health_check_interval": 30,
     }
 
@@ -148,32 +149,44 @@ def ssh_connection_key(connection_id: str) -> str:
 SSH_CONNECTION_IDS_KEY = "ssh:connections:active"
 
 
+def parse_pubsub_message(msg: dict[str, Any] | None) -> Any | None:
+    """Decode a redis-py pub/sub frame into its JSON payload.
+
+    Returns ``None`` for control frames, empty payloads, and malformed JSON. Payloads
+    are always JSON objects, so a ``None`` return means "nothing to deliver".
+    """
+    if msg is None or msg.get("type") != "message":
+        return None
+    raw = msg.get("data")
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
 def iter_pubsub_messages(pubsub: PubSub) -> Iterable[Any]:
     """Iterate over messages from a Redis PubSub instance.
 
-    Stops cleanly on pubsub teardown (`ConnectionError`, `OSError`); skips
+    Stops cleanly on a dropped Redis connection (``REDIS_CONN_ERRORS``); skips
     individual malformed JSON payloads without ending iteration so a single
     bad message can't kill the listener.
     """
     try:
         for msg in pubsub.listen():
-            if msg.get("type") != "message":
+            parsed = parse_pubsub_message(msg)
+            if parsed is None:
                 continue
-            raw = msg.get("data")
-            if raw is None:
-                continue
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="ignore")
-            try:
-                yield json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-    except (ConnectionError, OSError):
+            yield parsed
+    except REDIS_CONN_ERRORS:
         return
 
 
 def _sync[T](value: Awaitable[T] | T) -> T:
-    return value  # type: ignore
+    return value  # type: ignore[return-value]
 
 
 def _with_redis_auth(url: str, acl_enabled: bool, username: str, password: str) -> str:
@@ -279,6 +292,9 @@ class SyncRedisClient:
 
     def incr(self, key: str) -> int:
         return int(_sync(self._control.incr(key)))
+
+    def eval(self, script: str, numkeys: int, *keys_and_args: str) -> str:
+        return _sync(self._control.eval(script, numkeys, *keys_and_args))
 
     def set_value(self, key: str, value: str) -> None:
         self._control.set(key, value)
@@ -402,7 +418,7 @@ class SyncRedisClient:
 
 
 def _awaitable[T](value: Awaitable[T] | T) -> Awaitable[T]:
-    return value  # type: ignore
+    return value  # type: ignore[return-value]
 
 
 class AsyncRedisClient:
@@ -482,6 +498,9 @@ class AsyncRedisClient:
 
     async def incr(self, key: str) -> int:
         return int(await _awaitable(self._control.incr(key)))
+
+    async def eval(self, script: str, numkeys: int, *keys_and_args: str) -> str:
+        return await _awaitable(self._control.eval(script, numkeys, *keys_and_args))
 
     async def set_value(self, key: str, value: str) -> None:
         await _awaitable(self._control.set(key, value))

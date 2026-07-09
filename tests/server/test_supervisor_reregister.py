@@ -4,23 +4,59 @@ When the root registry loses a node, ``Lifecycle`` re-registers it under a new
 node id. These tests prove the node also (a) moves its dispatch/command
 subscriptions to the new channel and (b) re-homes its already-registered
 workers under the new id, so the dispatcher can reach them again.
+
+The rebind is split in two: the heartbeat thread only records the target id
+(``rebind``), and the pubsub reader thread applies the actual subscribe /
+unsubscribe (``_apply_pending_rebind``). A redis-py ``PubSub`` must not be
+mutated from a second thread while its owner is reading it, so these tests
+assert ``rebind`` touches nothing and the reader-side apply does the switch.
 """
 
+import json
 import logging
-from typing import Any
+from collections.abc import Callable
+from threading import Lock
+from typing import Any, cast
 
+import pytest
+import redis.exceptions
+from redis.client import PubSub
+
+import server.supervisor.services.pubsub_reader as pubsub_reader_module
 from server.clients.redis import (
+    SyncRedisClient,
     node_cmd_channel,
     node_dispatch_channel,
     worker_key,
 )
+from server.supervisor.registry import WorkerRegistry
 from server.supervisor.services.command_listener import CommandListener, _CommandStream
 from server.supervisor.services.grpc_server import SupervisorServicer
-from server.supervisor.services.lifecycle import Lifecycle
 from server.supervisor.services.task_listener import TaskListener
-from shared.schemas.node import NodeInfo
+from tests.server.supervisor_helpers import StubLifecycle, StubRegistry
 
 _LOGGER = logging.getLogger("test.reregister")
+_ANY_OBJECT: Any = None
+
+
+class _FlakyRedis:
+    """subscribe_control raises ConnectionError `fail_times` times, then returns
+    a fresh _FakePubSub subscribed to the requested channel."""
+
+    def __init__(self, fail_times: int) -> None:
+        self.fail_times = fail_times
+        self.calls: list[str] = []
+        self.last_pubsub: _FakePubSub | None = None
+
+    def subscribe_control(self, channel: str) -> PubSub:
+        self.calls.append(channel)
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise redis.exceptions.ConnectionError("redis down")
+        pubsub = _FakePubSub()
+        pubsub.subscribe(channel)
+        self.last_pubsub = pubsub
+        return _as_pubsub(pubsub)
 
 
 class _FakePubSub:
@@ -30,6 +66,10 @@ class _FakePubSub:
         self.subscribed: set[str] = set()
         self.subscribe_log: list[str] = []
         self.unsubscribe_log: list[str] = []
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
     def subscribe(self, channel: str) -> None:
         self.subscribed.add(channel)
@@ -40,34 +80,75 @@ class _FakePubSub:
         self.unsubscribe_log.append(channel)
 
 
+def _as_pubsub(fake: _FakePubSub) -> PubSub:
+    return cast(PubSub, fake)
+
+
+class _RaisingSubscribePubSub(_FakePubSub):
+    """Raises ConnectionError the first time it is asked to subscribe to
+    ``raise_on`` (the rebind target), then behaves normally."""
+
+    def __init__(self, raise_on: str) -> None:
+        super().__init__()
+        self.raise_on = raise_on
+
+    def subscribe(self, channel: str) -> None:
+        if channel == self.raise_on:
+            self.raise_on = ""
+            raise redis.exceptions.ConnectionError("dropped mid-switch")
+        super().subscribe(channel)
+
+
+class _ScriptedPubSub(_FakePubSub):
+    """PubSub whose get_message runs a supplied callback, so a test can raise or
+    stop the reader loop deterministically."""
+
+    def __init__(self, on_get: "Callable[[_ScriptedPubSub], Any]") -> None:
+        super().__init__()
+        self._on_get = on_get
+
+    def get_message(self, timeout: float) -> Any:
+        return self._on_get(self)
+
+
 # --------------------------------------------------------------------------- #
-# TaskListener.rebind
+# TaskListener.rebind (heartbeat thread) + _apply_pending_rebind (reader thread)
 # --------------------------------------------------------------------------- #
 
 
 def _build_task_listener(node_id: str) -> tuple[TaskListener, _FakePubSub]:
-    listener = TaskListener.__new__(TaskListener)
-    listener.logger = _LOGGER
-    listener._node_id = node_id
-    listener._qs = {}
+    listener = TaskListener(_ANY_OBJECT, node_id, _LOGGER)
     pubsub = _FakePubSub()
     pubsub.subscribe(node_dispatch_channel(node_id))
-    listener._pubsub = pubsub  # type: ignore[assignment]
-    listener._thread = object()  # type: ignore[assignment]
-    listener._loop = None
-    listener._running = True
+    listener._pubsub = _as_pubsub(pubsub)
     return listener, pubsub
 
 
-def test_task_listener_rebind_moves_subscription() -> None:
+def test_task_listener_rebind_records_target_without_touching_pubsub() -> None:
+    # Regression guard for the cross-thread race: rebind runs on the heartbeat
+    # thread and must NOT mutate the live pubsub.
     listener, pubsub = _build_task_listener("nde-1")
-    listener.add_worker("wkr-1")
 
     listener.rebind("nde-2")
 
+    assert listener._pending_node_id == "nde-2"
+    assert pubsub.subscribe_log == [node_dispatch_channel("nde-1")]
+    assert pubsub.unsubscribe_log == []
+    assert not listener._rebind_applied.is_set()
+
+
+def test_task_listener_apply_pending_moves_subscription() -> None:
+    listener, pubsub = _build_task_listener("nde-1")
+    listener.add_worker("wkr-1")
+    listener.rebind("nde-2")
+
+    live = listener._apply_pending_rebind("nde-1")
+
+    assert live == "nde-2"
     assert listener._node_id == "nde-2"
     assert node_dispatch_channel("nde-2") in pubsub.subscribed
     assert node_dispatch_channel("nde-1") not in pubsub.subscribed
+    assert listener._rebind_applied.is_set()
     # worker queues survive the rebind so in-flight streams keep working
     assert "wkr-1" in listener._qs
 
@@ -75,53 +156,253 @@ def test_task_listener_rebind_moves_subscription() -> None:
 def test_task_listener_rebind_same_id_is_noop() -> None:
     listener, pubsub = _build_task_listener("nde-1")
     listener.rebind("nde-1")
-    assert pubsub.subscribe_log == [node_dispatch_channel("nde-1")]
+    # same id resolves immediately, nothing pending, no pubsub mutation on apply
+    assert listener._rebind_applied.is_set()
+    assert listener._apply_pending_rebind("nde-1") == "nde-1"
     assert pubsub.unsubscribe_log == []
 
 
-def test_task_listener_rebind_before_start_only_updates_id() -> None:
-    listener = TaskListener.__new__(TaskListener)
-    listener.logger = _LOGGER
-    listener._node_id = "nde-1"
-    listener._qs = {}
-    listener._pubsub = None
-    listener.rebind("nde-2")
-    assert listener._node_id == "nde-2"
-
-
 # --------------------------------------------------------------------------- #
-# CommandListener.rebind
+# _CommandStream.rebind + _apply_pending_rebind
 # --------------------------------------------------------------------------- #
 
 
-def test_command_listener_rebind_moves_subscription() -> None:
-    stream = _CommandStream.__new__(_CommandStream)
-    stream.node_id = "nde-1"
-    stream.logger = _LOGGER
+def _build_command_stream(node_id: str) -> tuple[_CommandStream, _FakePubSub]:
+    stream = _CommandStream(node_id, _ANY_OBJECT, None, _LOGGER)
     pubsub = _FakePubSub()
-    pubsub.subscribe(node_cmd_channel("nde-1"))
-    stream._pubsub = pubsub  # type: ignore[assignment]
+    pubsub.subscribe(node_cmd_channel(node_id))
+    stream._pubsub = _as_pubsub(pubsub)
+    return stream, pubsub
 
-    listener = CommandListener.__new__(CommandListener)
-    listener.logger = _LOGGER
-    listener._node_id = "nde-1"
+
+def test_command_listener_rebind_records_target_without_touching_pubsub() -> None:
+    stream, pubsub = _build_command_stream("nde-1")
+    listener = CommandListener(_ANY_OBJECT, "nde-1", _ANY_OBJECT, _LOGGER)
     listener._cmd_stream = stream
 
     listener.rebind("nde-2")
 
     assert listener._node_id == "nde-2"
-    assert stream.node_id == "nde-2"
+    assert stream._pending_node_id == "nde-2"
+    assert pubsub.unsubscribe_log == []
+
+
+def test_command_stream_apply_pending_moves_subscription() -> None:
+    stream, pubsub = _build_command_stream("nde-1")
+    stream.rebind("nde-2")
+
+    live = stream._apply_pending_rebind("nde-1")
+
+    assert live == "nde-2"
+    assert stream._node_id == "nde-2"
     assert node_cmd_channel("nde-2") in pubsub.subscribed
     assert node_cmd_channel("nde-1") not in pubsub.subscribed
+    assert stream._rebind_applied.is_set()
 
 
-def test_command_listener_rebind_before_start_only_updates_id() -> None:
-    listener = CommandListener.__new__(CommandListener)
-    listener.logger = _LOGGER
-    listener._node_id = "nde-1"
-    listener._cmd_stream = None
+# --------------------------------------------------------------------------- #
+# Reader self-healing: _resubscribe reconnects instead of letting the thread die
+# --------------------------------------------------------------------------- #
+
+
+def test_task_listener_resubscribe_retries_until_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pubsub_reader_module, "_RECONNECT_BACKOFF_SEC", 0.0)
+    redis = _FlakyRedis(fail_times=2)
+    listener = TaskListener(cast(SyncRedisClient, redis), "nde-1", _LOGGER)
+    stale = _FakePubSub()
+    stale.subscribe(node_dispatch_channel("nde-1"))
+    listener._pubsub = _as_pubsub(stale)
+    listener._running = True
+
+    assert listener._resubscribe("nde-1")
+    # failed twice then succeeded -> three subscribe attempts on the live channel
+    assert redis.calls == [node_dispatch_channel("nde-1")] * 3
+    assert redis.last_pubsub is not None
+    assert node_dispatch_channel("nde-1") in redis.last_pubsub.subscribed
+    assert stale.closed  # the dead pubsub is closed before reconnecting
+
+
+def test_task_listener_resubscribe_gives_up_when_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pubsub_reader_module, "_RECONNECT_BACKOFF_SEC", 0.0)
+    redis = _FlakyRedis(fail_times=1000)
+    listener = TaskListener(cast(SyncRedisClient, redis), "nde-1", _LOGGER)
+    listener._running = False
+    # a stopped listener must not retry forever; it returns without reconnecting
+    assert not listener._resubscribe("nde-1")
+    assert redis.calls == []
+
+
+def test_command_stream_resubscribe_retries_until_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pubsub_reader_module, "_RECONNECT_BACKOFF_SEC", 0.0)
+    redis = _FlakyRedis(fail_times=1)
+    stream = _CommandStream("nde-1", cast(SyncRedisClient, redis), None, _LOGGER)
+    stream._running = True
+    stream._pubsub = _as_pubsub(_FakePubSub())
+
+    assert stream._resubscribe("nde-1")
+    assert redis.calls == [node_cmd_channel("nde-1")] * 2
+    assert redis.last_pubsub is not None
+    assert node_cmd_channel("nde-1") in redis.last_pubsub.subscribed
+
+
+def test_command_stream_resubscribe_gives_up_when_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pubsub_reader_module, "_RECONNECT_BACKOFF_SEC", 0.0)
+    redis = _FlakyRedis(fail_times=1000)
+    stream = _CommandStream("nde-1", cast(SyncRedisClient, redis), None, _LOGGER)
+    stream._running = False
+    assert not stream._resubscribe("nde-1")
+    assert stream._pubsub is None
+    assert redis.calls == []
+
+
+def test_task_listener_apply_rearms_pending_when_connection_drops() -> None:
+    # Regression guard for the lost-rebind race: if the subscribe fails mid-switch
+    # the target must be re-armed, not silently dropped.
+    listener, _ = _build_task_listener("nde-1")
+    pubsub = _RaisingSubscribePubSub(raise_on=node_dispatch_channel("nde-2"))
+    pubsub.subscribe(node_dispatch_channel("nde-1"))
+    listener._pubsub = _as_pubsub(pubsub)
     listener.rebind("nde-2")
-    assert listener._node_id == "nde-2"
+
+    with pytest.raises(redis.exceptions.ConnectionError):
+        listener._apply_pending_rebind("nde-1")
+
+    assert listener._pending_node_id == "nde-2"  # re-armed
+    assert not listener._rebind_applied.is_set()  # not marked applied
+    assert listener._node_id == "nde-1"  # unchanged until it lands
+
+    # a retry on the recovered connection completes the move
+    assert listener._apply_pending_rebind("nde-1") == "nde-2"
+    assert node_dispatch_channel("nde-2") in pubsub.subscribed
+    assert node_dispatch_channel("nde-1") not in pubsub.subscribed
+    assert listener._rebind_applied.is_set()
+
+
+def test_command_stream_apply_rearms_pending_when_connection_drops() -> None:
+    stream, _ = _build_command_stream("nde-1")
+    pubsub = _RaisingSubscribePubSub(raise_on=node_cmd_channel("nde-2"))
+    pubsub.subscribe(node_cmd_channel("nde-1"))
+    stream._pubsub = _as_pubsub(pubsub)
+    stream.rebind("nde-2")
+
+    with pytest.raises(redis.exceptions.ConnectionError):
+        stream._apply_pending_rebind("nde-1")
+
+    assert stream._pending_node_id == "nde-2"
+    assert not stream._rebind_applied.is_set()
+    assert stream._node_id == "nde-1"
+
+    assert stream._apply_pending_rebind("nde-1") == "nde-2"
+    assert node_cmd_channel("nde-2") in pubsub.subscribed
+    assert stream._rebind_applied.is_set()
+
+
+def test_task_listener_run_reconnects_and_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Full loop: a dropped read triggers reconnect and the loop keeps running on
+    # the fresh pubsub instead of the thread dying.
+    monkeypatch.setattr(pubsub_reader_module, "_RECONNECT_BACKOFF_SEC", 0.0)
+    events: list[str] = []
+
+    def _stop_after_reconnect(ps: _ScriptedPubSub) -> Any:
+        events.append("read-after-reconnect")
+        listener._running = False
+        return None
+
+    reconnected = _ScriptedPubSub(_stop_after_reconnect)
+
+    class _Redis:
+        def subscribe_control(self, channel: str) -> PubSub:
+            reconnected.subscribe(channel)
+            return _as_pubsub(reconnected)
+
+    listener = TaskListener(cast(SyncRedisClient, _Redis()), "nde-1", _LOGGER)
+    listener._loop = cast(Any, object())  # never used: no message is processed
+
+    def _drop_once(ps: _ScriptedPubSub) -> Any:
+        raise redis.exceptions.ConnectionError("connection dropped")
+
+    original = _ScriptedPubSub(_drop_once)
+    original.subscribe(node_dispatch_channel("nde-1"))
+    listener._pubsub = _as_pubsub(original)
+    listener._running = True
+
+    listener._read_loop()
+
+    assert events == ["read-after-reconnect"]  # resumed reading after reconnect
+    assert original.closed  # old pubsub torn down
+    assert node_dispatch_channel("nde-1") in reconnected.subscribed
+
+
+def test_command_stream_run_reconnects_and_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pubsub_reader_module, "_RECONNECT_BACKOFF_SEC", 0.0)
+    events: list[str] = []
+
+    def _stop_after_reconnect(ps: _ScriptedPubSub) -> Any:
+        events.append("read-after-reconnect")
+        stream._running = False
+        return None
+
+    reconnected = _ScriptedPubSub(_stop_after_reconnect)
+
+    class _Redis:
+        def subscribe_control(self, channel: str) -> PubSub:
+            reconnected.subscribe(channel)
+            return _as_pubsub(reconnected)
+
+    stream = _CommandStream("nde-1", cast(SyncRedisClient, _Redis()), None, _LOGGER)
+
+    def _drop_once(ps: _ScriptedPubSub) -> Any:
+        raise redis.exceptions.ConnectionError("connection dropped")
+
+    original = _ScriptedPubSub(_drop_once)
+    original.subscribe(node_cmd_channel("nde-1"))
+    stream._pubsub = _as_pubsub(original)
+    stream._running = True
+
+    stream._read_loop()
+
+    assert events == ["read-after-reconnect"]
+    assert original.closed
+    assert node_cmd_channel("nde-1") in reconnected.subscribed
+
+
+def test_task_listener_survives_a_handler_error() -> None:
+    # A handler that raises (e.g. a schema-invalid frame) must not kill the
+    # reader: it is logged and the loop reads the next frame. Distinct from a
+    # connection drop, so no reconnect is triggered.
+    reads: list[str] = []
+
+    def _on_get(ps: _ScriptedPubSub) -> Any:
+        if not reads:
+            reads.append("bad-frame")
+            return {"type": "message", "data": json.dumps({"kind": "task"})}
+        reads.append("next-read")
+        listener._running = False
+        return None
+
+    pubsub = _ScriptedPubSub(_on_get)
+    pubsub.subscribe(node_dispatch_channel("nde-1"))
+    listener = TaskListener(_ANY_OBJECT, "nde-1", _LOGGER)
+    listener._loop = cast(Any, object())  # never used: the frame fails validation
+    listener._pubsub = _as_pubsub(pubsub)
+    listener._running = True
+
+    listener._read_loop()
+
+    assert reads == ["bad-frame", "next-read"]  # kept reading past the bad frame
+    assert not pubsub.closed  # a handler error is not a connection drop
 
 
 # --------------------------------------------------------------------------- #
@@ -146,23 +427,38 @@ class _FakeWorkerRegistry:
 
 
 class _FakeRedis:
-    def __init__(self) -> None:
+    """Simulates the re-home Lua: HSET node_id only for keys that exist."""
+
+    def __init__(self, existing: set[str] | None = None) -> None:
+        self.existing = existing if existing is not None else set()
         self.hash_writes: list[tuple[str, dict[str, Any]]] = []
 
-    def hash_set(self, key: str, mapping: dict[str, Any]) -> None:
-        self.hash_writes.append((key, mapping))
+    def eval(self, script: str, numkeys: int, *args: str) -> int:
+        keys = args[:numkeys]
+        node_id = args[numkeys]
+        rehomed = 0
+        for key in keys:
+            if key in self.existing:
+                self.hash_writes.append((key, {"node_id": node_id}))
+                rehomed += 1
+        return rehomed
 
 
 def _build_servicer(
-    node_id: str, token_to_id: dict[str, str | None]
+    node_id: str,
+    token_to_id: dict[str, str | None],
+    existing: set[str] | None = None,
 ) -> tuple[SupervisorServicer, _FakeRedis]:
+    if existing is None:
+        existing = {worker_key(w) for w in token_to_id.values() if w is not None}
+    redis = _FakeRedis(existing)
     servicer = SupervisorServicer.__new__(SupervisorServicer)
-    servicer._registry = _FakeWorkerRegistry(token_to_id)  # type: ignore[assignment]
-    redis = _FakeRedis()
-    servicer._redis = redis  # type: ignore[assignment]
+    servicer._registry = cast(WorkerRegistry, _FakeWorkerRegistry(token_to_id))
+    servicer._redis = cast(SyncRedisClient, redis)
     servicer._node_id = node_id
     servicer._node_alias = "worker-box"
     servicer._logger = _LOGGER
+    servicer._lock = Lock()
     return servicer, redis
 
 
@@ -180,6 +476,18 @@ def test_rebind_node_rehomes_all_registered_workers() -> None:
     assert len(redis.hash_writes) == 2
 
 
+def test_rebind_node_skips_workers_without_a_record() -> None:
+    # Full-wipe scenario: the worker key was evicted; re-home must NOT resurrect
+    # a partial record.
+    servicer, redis = _build_servicer(
+        "nde-1", {"tok-a": "wkr-1", "tok-b": "wkr-2"}, existing={worker_key("wkr-1")}
+    )
+
+    servicer.rebind_node("nde-2")
+
+    assert redis.hash_writes == [(worker_key("wkr-1"), {"node_id": "nde-2"})]
+
+
 def test_rebind_node_stamps_future_registrations() -> None:
     servicer, _ = _build_servicer("nde-1", {})
     servicer.rebind_node("nde-9")
@@ -194,83 +502,6 @@ def test_rebind_node_same_id_is_noop() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Lifecycle wiring — callback fires on re-register, restoring dispatch
-# --------------------------------------------------------------------------- #
-
-
-def _build_lifecycle() -> Lifecycle:
-    instance = Lifecycle.__new__(Lifecycle)
-    instance._base_url = "http://root:8000"
-    instance._node_info = NodeInfo(
-        namespace="ns",
-        cluster="cl",
-        alias="worker-1",
-        version="0.1.0",
-        started_at="2026-05-13T00:00:00Z",
-        tags=[],
-        last_seen="2026-05-13T00:00:00Z",
-        max_gpu_count=0,
-    )
-    instance.logger = _LOGGER
-    instance._on_reregister = None
-    return instance
-
-
-class _StubRegistry:
-    def __init__(self, exists: bool) -> None:
-        self._exists = exists
-
-    def node_exists(self, node_id: str) -> bool:
-        return self._exists
-
-
-def test_reregister_invokes_callback_with_new_id() -> None:
-    seen: list[str] = []
-    instance = _build_lifecycle()
-    instance._node_registry = _StubRegistry(exists=False)  # type: ignore[assignment]
-    instance._node_id = "nde-1"
-    instance._unregister_published = True
-    instance._register = lambda: "nde-2"  # type: ignore[method-assign]
-    instance._publish_event = lambda *a, **k: None  # type: ignore[method-assign]
-    instance.set_reregister_callback(seen.append)
-
-    instance._reregister_if_lost()
-
-    assert instance._node_id == "nde-2"
-    assert seen == ["nde-2"]
-
-
-def test_reregister_present_does_not_invoke_callback() -> None:
-    seen: list[str] = []
-    instance = _build_lifecycle()
-    instance._node_registry = _StubRegistry(exists=True)  # type: ignore[assignment]
-    instance._node_id = "nde-1"
-    instance.set_reregister_callback(seen.append)
-
-    instance._reregister_if_lost()
-
-    assert seen == []
-
-
-def test_reregister_callback_error_does_not_break_heartbeat() -> None:
-    instance = _build_lifecycle()
-    instance._node_registry = _StubRegistry(exists=False)  # type: ignore[assignment]
-    instance._node_id = "nde-1"
-    instance._unregister_published = True
-    instance._register = lambda: "nde-2"  # type: ignore[method-assign]
-    instance._publish_event = lambda *a, **k: None  # type: ignore[method-assign]
-
-    def _boom(_new_id: str) -> None:
-        raise RuntimeError("rebind failed")
-
-    instance.set_reregister_callback(_boom)
-
-    # must not raise — a failed rebind should be logged, not crash the hb loop
-    instance._reregister_if_lost()
-    assert instance._node_id == "nde-2"
-
-
-# --------------------------------------------------------------------------- #
 # End-to-end: registry loss -> re-register-under-new-id -> dispatchable again
 # --------------------------------------------------------------------------- #
 
@@ -278,34 +509,28 @@ def test_reregister_callback_error_does_not_break_heartbeat() -> None:
 def test_full_reregister_rebinds_and_rehomes() -> None:
     """After a simulated registry loss and re-register under a new id, the node
     is subscribed on the NEW dispatch/command channels and its workers are
-    homed under the NEW id (so the host routes tasks to them)."""
+    homed under the NEW id (so the host routes tasks to them). The reader-side
+    apply is driven inline to stand in for the pubsub reader thread."""
     task_listener, task_pubsub = _build_task_listener("nde-1")
     task_listener.add_worker("wkr-1")
 
-    cmd_stream = _CommandStream.__new__(_CommandStream)
-    cmd_stream.node_id = "nde-1"
-    cmd_stream.logger = _LOGGER
-    cmd_pubsub = _FakePubSub()
-    cmd_pubsub.subscribe(node_cmd_channel("nde-1"))
-    cmd_stream._pubsub = cmd_pubsub  # type: ignore[assignment]
-    cmd_listener = CommandListener.__new__(CommandListener)
-    cmd_listener.logger = _LOGGER
-    cmd_listener._node_id = "nde-1"
+    cmd_stream, cmd_pubsub = _build_command_stream("nde-1")
+    cmd_listener = CommandListener(_ANY_OBJECT, "nde-1", _ANY_OBJECT, _LOGGER)
     cmd_listener._cmd_stream = cmd_stream
 
     servicer, redis = _build_servicer("nde-1", {"tok-a": "wkr-1"})
 
     def _on_reregister(new_node_id: str) -> None:
-        servicer.rebind_node(new_node_id)
         task_listener.rebind(new_node_id)
         cmd_listener.rebind(new_node_id)
+        # stand in for the reader threads applying the pending rebind
+        task_listener._apply_pending_rebind("nde-1")
+        cmd_stream._apply_pending_rebind("nde-1")
+        assert task_listener.wait_rebound(1.0)
+        assert cmd_listener.wait_rebound(1.0)
+        servicer.rebind_node(new_node_id)
 
-    lifecycle = _build_lifecycle()
-    lifecycle._node_registry = _StubRegistry(exists=False)  # type: ignore[assignment]
-    lifecycle._node_id = "nde-1"
-    lifecycle._unregister_published = True
-    lifecycle._register = lambda: "nde-2"  # type: ignore[method-assign]
-    lifecycle._publish_event = lambda *a, **k: None  # type: ignore[method-assign]
+    lifecycle = StubLifecycle(StubRegistry(exists=False), "nde-1")
     lifecycle.set_reregister_callback(_on_reregister)
 
     lifecycle._reregister_if_lost()

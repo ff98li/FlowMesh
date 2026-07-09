@@ -25,6 +25,7 @@ from shared.utils.manifest import RESULTS_NAME, sync_manifest
 from ..auth import default_principal, deregister_resource, register_resource
 from ..clients.redis import (
     NODE_EVENT_CHANNEL,
+    REDIS_CONN_ERRORS,
     TASK_EVENT_CURSOR_KEY,
     TASK_EVENT_STREAM_KEY,
     TASK_EVENT_STREAM_MAXLEN,
@@ -293,6 +294,10 @@ class EventMonitor:
                 rows = self._redis_client.xread_telemetry(
                     {TASK_EVENT_STREAM_KEY: cursor}, count=200, block_ms=1000
                 )
+                for _, entries in rows:
+                    cursor = self._consume_stream_batch(entries, cursor)
+                    if self._stop_event.is_set():
+                        break
             except Exception as exc:
                 if self._stop_event.is_set():
                     break
@@ -301,10 +306,6 @@ class EventMonitor:
                 )
                 time.sleep(2.0)
                 continue
-            for _, entries in rows:
-                cursor = self._consume_stream_batch(entries, cursor)
-                if self._stop_event.is_set():
-                    break
 
     def _consume_stream_batch(
         self, entries: list[tuple[str, dict[str, Any]]], cursor: str
@@ -332,6 +333,9 @@ class EventMonitor:
             if isinstance(event, TaskEvent):
                 try:
                     self._handle_task_event(event)
+                except REDIS_CONN_ERRORS:
+                    # Propagate so the loop backs off and replays from this cursor.
+                    raise
                 except Exception as exc:
                     # Don't advance past a handler failure: it may be transient,
                     # and the watchdog only reclaims dead workers (not a task stuck

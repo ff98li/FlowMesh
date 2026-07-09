@@ -1,7 +1,8 @@
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator
 from pathlib import Path
+from threading import Lock
 
 import grpc
 import grpc.aio
@@ -28,14 +29,32 @@ from ..schemas import WorkerStatus
 from ..services.relay_service import RelayService
 from ..services.task_listener import TaskListener
 
+# Rewrite node_id for each worker key that still exists, atomically. KEYS are
+# worker keys; ARGV[1] is the new node id. Returns the count actually rewritten.
+_REHOME_LUA = """
+local rehomed = 0
+for _, key in ipairs(KEYS) do
+  if redis.call('EXISTS', key) == 1 then
+    redis.call('HSET', key, 'node_id', ARGV[1])
+    rehomed = rehomed + 1
+  end
+end
+return rehomed
+"""
 
-def _token_from_metadata(metadata: Iterable[tuple[str, str]]) -> WorkerTokenType | None:
-    for key, value in metadata:
-        key_l = key.lower()
-        if key_l == "authorization" and value.startswith("Bearer "):
-            return value[7:]  # type: ignore
-        if key_l == "x-worker-token":
-            return value  # type: ignore
+
+def _token_from_context(context: grpc.aio.ServicerContext) -> WorkerTokenType | None:
+    if metadata := context.invocation_metadata():
+        for key, value in metadata:
+            key_l = key.lower()
+            if isinstance(value, (bytes, bytearray)):
+                value = value.decode("utf-8", errors="ignore")
+            elif isinstance(value, memoryview):
+                value = value.tobytes().decode("utf-8", errors="ignore")
+            if key_l == "authorization" and value.startswith("Bearer "):
+                return WorkerTokenType(value[7:])
+            if key_l == "x-worker-token":
+                return WorkerTokenType(value)
     return None
 
 
@@ -86,31 +105,47 @@ class SupervisorServicer(supervisor_pb2_grpc.SupervisorServicer):
         self._node_id = node_id
         self._node_alias = node_alias
         self._logger = logger
+        # Guards _node_id and the registry-vs-rehome window against concurrent
+        # RegisterWorker (grpc loop thread) and rebind_node (heartbeat thread).
+        self._lock = Lock()
 
     def rebind_node(self, node_id: str) -> None:
         """Re-home this node's workers under a new node id.
 
         Future registrations stamp the new id, and every already-registered
         worker's ``node_id`` field is rewritten in Redis so the dispatcher
-        routes tasks to them on the node's new dispatch channel.
+        routes tasks to them on the node's new dispatch channel. A worker whose
+        record no longer exists (e.g. Redis was wiped) is skipped rather than
+        resurrected as a partial record.
         """
-        if node_id == self._node_id:
-            return
-        old_node_id = self._node_id
-        self._node_id = node_id
-        rehomed = 0
-        for worker in self._registry.all_workers():
-            worker_id = self._registry.get_worker_id(worker.token)
-            if worker_id is None:
-                continue
-            self._redis.hash_set(worker_key(worker_id), {"node_id": node_id})
-            rehomed += 1
-        self._logger.info(
-            "Re-homed %d worker(s) from node %s to %s",
-            rehomed,
-            old_node_id,
-            node_id,
-        )
+        with self._lock:
+            if node_id == self._node_id:
+                return
+            old_node_id = self._node_id
+            self._node_id = node_id
+            worker_ids = [
+                worker_id
+                for worker in self._registry.all_workers()
+                if (worker_id := self._registry.get_worker_id(worker.token)) is not None
+            ]
+            rehomed, skipped = self._rehome_workers(worker_ids, node_id)
+            self._logger.info(
+                "Re-homed %d worker(s) (%d skipped: no record) from node %s to %s",
+                rehomed,
+                skipped,
+                old_node_id,
+                node_id,
+            )
+
+    def _rehome_workers(self, worker_ids: list[str], node_id: str) -> tuple[int, int]:
+        """Rewrite node_id only for workers whose record still exists, atomically
+        so a worker deleted mid-rebind is skipped rather than resurrected as a
+        partial record. Returns (rehomed, skipped)."""
+        if not worker_ids:
+            return 0, 0
+        keys = [worker_key(worker_id) for worker_id in worker_ids]
+        rehomed = int(self._redis.eval(_REHOME_LUA, len(keys), *keys, node_id))
+        return rehomed, len(worker_ids) - rehomed
 
     async def RegisterWorker(
         self,
@@ -123,11 +158,15 @@ class SupervisorServicer(supervisor_pb2_grpc.SupervisorServicer):
         worker_meta = _payload_from_struct(request.meta)
         worker_id = new_worker_id(self._redis.incr(WORKER_ID_SEQ_KEY))
         worker_meta["id"] = worker_id
-        worker_meta["node_id"] = self._node_id
         worker_meta["node_alias"] = self._node_alias
-        self._redis.sadd(WORKERS_SET_KEY, worker_id)
-        self._redis.hash_set(worker_key(worker_id), worker_meta)
-        self._registry.set_worker_id(worker.token, worker_id)
+        # Stamp node_id, persist the record, and insert into the registry as one unit so
+        # a concurrent rebind_node either sees this worker in its snapshot or stamps it
+        # with the new id.
+        with self._lock:
+            worker_meta["node_id"] = self._node_id
+            self._redis.sadd(WORKERS_SET_KEY, worker_id)
+            self._redis.hash_set(worker_key(worker_id), worker_meta)
+            self._registry.set_worker_id(worker.token, worker_id)
         self._task_listener.add_worker(worker_id)
         try:
             worker.set_worker_id(worker_id)
@@ -227,18 +266,16 @@ class SupervisorServicer(supervisor_pb2_grpc.SupervisorServicer):
     def _get_worker_from_context(
         self, context: grpc.aio.ServicerContext
     ) -> WorkerAdapter | None:
-        token = _token_from_metadata(context.invocation_metadata())  # type: ignore
-        if token is None:
-            return None
-        return self._registry.try_get(token)
+        if token := _token_from_context(context):
+            return self._registry.try_get(token)
+        return None
 
     def _get_worker_id_from_context(
         self, context: grpc.aio.ServicerContext
     ) -> str | None:
-        token = _token_from_metadata(context.invocation_metadata())  # type: ignore
-        if token is None:
-            return None
-        return self._registry.get_worker_id(token)
+        if token := _token_from_context(context):
+            return self._registry.get_worker_id(token)
+        return None
 
 
 _GRPC_MAX_MSG_BYTES = 1024 * 1024 * 1024  # 1 GB
@@ -263,10 +300,6 @@ class GrpcServer:
             registry, redis, node_id, node_alias, task_listener, relay_service, logger
         )
         self._listen_addr = f"{host}:{port}"
-
-    def rebind_node(self, node_id: str) -> None:
-        """Re-home registered workers under a new node id."""
-        self._servicer.rebind_node(node_id)
 
     async def start(self) -> None:
         if self._server is not None:
@@ -314,3 +347,7 @@ class GrpcServer:
         await self._server.stop(grace)
         self._server = None
         self._logger.info("Server gRPC server stopped")
+
+    def rebind_node(self, node_id: str) -> None:
+        """Re-home registered workers under a new node id."""
+        self._servicer.rebind_node(node_id)

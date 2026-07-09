@@ -6,9 +6,9 @@ import secrets
 from collections.abc import Callable, Iterable
 from concurrent import futures
 from threading import Thread
+from typing import Any
 
 from pydantic import ValidationError
-from redis.client import PubSub
 
 from shared.schemas.command import (
     CommandMessage,
@@ -16,15 +16,11 @@ from shared.schemas.command import (
     CommandType,
 )
 
-from ...clients.redis import (
-    NODE_RESPONSE_CHANNEL,
-    SyncRedisClient,
-    iter_pubsub_messages,
-    node_cmd_channel,
-)
+from ...clients.redis import NODE_RESPONSE_CHANNEL, SyncRedisClient, node_cmd_channel
 from ...utils.concurrent import Sentinel, TaskReceiver
 from ..adapters.docker import DockerWorkerConfig
 from ..manager import WorkerInitConfig, WorkerManager
+from .pubsub_reader import RebindableReader
 from .ssh_relay import SshRelayService
 
 type ResponseHandler = Callable[[CommandResponse], None]
@@ -53,27 +49,9 @@ def _cmd_receiver_loop(
         q.put((cmd, make_handler(cmd_id)))
 
 
-def _pubsub_loop(
-    redis: SyncRedisClient,
-    pubsub: PubSub,
-    q: queue.Queue[tuple[CommandMessage, ResponseHandler]],
-    logger: logging.Logger,
-) -> None:
-    for data in iter_pubsub_messages(pubsub):
-        try:
-            cmd = CommandMessage.model_validate(data)
-        except ValidationError as e:
-            logger.error("Invalid command message: %s", e)
-            continue
-
-        def send_response(resp: CommandResponse) -> None:
-            redis.publish_control(NODE_RESPONSE_CHANNEL, resp.model_dump_json())
-
-        q.put((cmd, send_response))
-
-
-class _CommandStream:
+class _CommandStream(RebindableReader):
     _SENTINEL = Sentinel()
+    _label = "Command stream"
 
     def __init__(
         self,
@@ -82,34 +60,31 @@ class _CommandStream:
         cmd_receiver: TaskReceiver[CommandMessage, CommandResponse] | None,
         logger: logging.Logger,
     ):
-        self.node_id = node_id
-        self.redis = redis
+        super().__init__(redis, node_id, logger)
         self.cmd_receiver = cmd_receiver
-        self.logger = logger
         self._cmd_queue: (
             queue.Queue[tuple[CommandMessage, ResponseHandler] | Sentinel] | None
         ) = None
-        self._pubsub: PubSub | None = None
+
+    def _channel(self, node_id: str) -> str:
+        return node_cmd_channel(node_id)
 
     def close(self) -> None:
         if self._cmd_queue is not None:
             self._cmd_queue.put(self._SENTINEL)
             self._cmd_queue = None
 
-    def rebind(self, node_id: str) -> None:
-        """Move the command subscription to a new node id on the live pubsub."""
-        if node_id == self.node_id:
+    def _send_response(self, resp: CommandResponse) -> None:
+        self._redis.publish_control(NODE_RESPONSE_CHANNEL, resp.model_dump_json())
+
+    def _handle_message(self, data: Any) -> None:
+        try:
+            cmd = CommandMessage.model_validate(data)
+        except ValidationError as e:
+            self.logger.error("Invalid command message: %s", e)
             return
-        old_node_id = self.node_id
-        self.node_id = node_id
-        pubsub = self._pubsub
-        if pubsub is None:
-            return
-        pubsub.subscribe(node_cmd_channel(node_id))
-        pubsub.unsubscribe(node_cmd_channel(old_node_id))
-        self.logger.info(
-            "Command stream rebound from node %s to %s", old_node_id, node_id
-        )
+        if self._cmd_queue is not None:
+            self._cmd_queue.put((cmd, self._send_response))
 
     def iter_stream(self) -> Iterable[tuple[CommandMessage, ResponseHandler]]:
         if self._cmd_queue is not None:
@@ -126,13 +101,10 @@ class _CommandStream:
             )
             task_thread.start()
 
-        pubsub = self.redis.subscribe_control(node_cmd_channel(self.node_id))
-        self._pubsub = pubsub
+        self._subscribe()
+        self._running = True
         pubsub_thread = Thread(
-            target=_pubsub_loop,
-            args=(self.redis, pubsub, cmd_queue, self.logger),
-            name="CommandPubSubThread",
-            daemon=True,
+            target=self._read_loop, name="CommandPubSubThread", daemon=True
         )
         pubsub_thread.start()
 
@@ -144,8 +116,11 @@ class _CommandStream:
                     break
                 yield item
         finally:
-            self._pubsub = None
-            pubsub.close()
+            self._running = False
+            pubsub_thread.join()
+            if self._pubsub is not None:
+                self._pubsub.close()
+                self._pubsub = None
 
 
 class CommandListener:
@@ -218,11 +193,17 @@ class CommandListener:
         )
 
     def rebind(self, node_id: str) -> None:
-        """Move the command subscription to a new node id without a restart."""
+        """Request moving the command subscription to a new node id.
+
+        The reader thread applies the switch; ``wait_rebound`` blocks until it has taken
+        effect.
+        """
         self._node_id = node_id
-        stream = self._cmd_stream
-        if stream is not None:
+        if stream := self._cmd_stream:
             stream.rebind(node_id)
+
+    def wait_rebound(self, timeout: float) -> bool:
+        return stream.wait_rebound(timeout) if (stream := self._cmd_stream) else True
 
     async def stop(self) -> None:
         if self._thread is None or self._cmd_stream is None:
