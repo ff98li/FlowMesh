@@ -134,6 +134,43 @@ class Dispatcher:
         self._requeue_task(task_id, reason=reason, count_retry=False)
         return False
 
+    def _grace_then_fail_undeliverable(
+        self,
+        task_id: str,
+        record: TaskRecord,
+        reason: str,
+        message: str,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> bool:
+        """Handle a selected worker that turned out undeliverable due to an
+        infrastructure fault.
+
+        Retry without spending the task's ``max_attempts`` budget and then fail after
+        ``no_worker_grace_sec``.
+        """
+        self._runtime.release_merge(task_id)
+        record.last_error = message
+        now = time.time()
+        if record.no_dispatch_since is None:
+            record.no_dispatch_since = now
+        waited = now - record.no_dispatch_since
+        if waited >= self._no_worker_grace_sec:
+            self._logger.warning(
+                "Task %s undeliverable after %.0fs (%s); failing",
+                task_id,
+                waited,
+                reason,
+            )
+            payload = {"reason": reason}
+            if extra_payload:
+                payload.update(extra_payload)
+            self._fail_task(
+                task_id, message, worker_id=record.last_failed_worker, payload=payload
+            )
+            return False
+        self._requeue_task(task_id, reason=reason, front=True, count_retry=False)
+        return False
+
     def _grace_then_fail_exhausted(
         self, task_id: str, record: TaskRecord, failed_ids: set[str]
     ) -> bool:
@@ -450,18 +487,40 @@ class Dispatcher:
         try:
             receivers = self._worker_registry.publish_task(worker, message)
         except Exception as exc:
-            self._logger.warning("Failed to publish task %s: %s", task_id, exc)
-            self._requeue_task(task_id, reason="publish_failed", front=True)
-            return False
+            self._logger.warning(
+                "Failed to publish task %s to worker %s: %s", task_id, worker.id, exc
+            )
+            return self._grace_then_fail_undeliverable(
+                task_id,
+                record,
+                reason="publish_failed",
+                message=f"Failed to publish task to worker {worker.id}: {exc}",
+                extra_payload={"worker_id": worker.id, "node_id": worker.node_id},
+            )
 
         if receivers <= 0:
             self._logger.info(
-                "No subscribers on tasks channel; delaying task %s", task_id
+                "Node %s dispatch channel has no subscriber; delaying task %s "
+                "(worker %s)",
+                worker.node_id,
+                task_id,
+                worker.id,
             )
-            self._requeue_task(task_id, reason="no_subscribers", front=True)
-            return False
+            return self._grace_then_fail_undeliverable(
+                task_id,
+                record,
+                reason="no_dispatch_subscriber",
+                message=(
+                    f"Selected worker {worker.id} on node {worker.node_id} is "
+                    "undeliverable: nothing is subscribed to the node's dispatch "
+                    "channel (the node may be down, restarting, or its worker "
+                    "registration stale)"
+                ),
+                extra_payload={"worker_id": worker.id, "node_id": worker.node_id},
+            )
 
         # 9. Mark dispatched
+        record.no_dispatch_since = None
         self._runtime.mark_dispatched(task_id, worker)
         if merged_children:
             try:
