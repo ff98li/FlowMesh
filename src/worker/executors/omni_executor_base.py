@@ -7,7 +7,6 @@ focused on its generation logic.
 """
 
 import gc
-import importlib.util
 import json
 import logging
 import os
@@ -15,6 +14,7 @@ import struct
 import tempfile
 import wave
 from abc import abstractmethod
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -40,11 +40,25 @@ except Exception:
         np = None
         torch = None
 
-logger = logging.getLogger(__name__)
+try:
+    from vllm import RequestOutput as RequestOutput
+    from vllm_omni.entrypoints.omni import Omni as Omni
+    from vllm_omni.outputs import OmniRequestOutput as OmniRequestOutput
 
-# find_spec, not import: importing vllm_omni rebinds vllm.v1.request.Request
-# and breaks plain-model warmup.
-_HAS_OMNI: bool = importlib.util.find_spec("vllm_omni") is not None
+    _HAS_OMNI = True
+except Exception:
+    if TYPE_CHECKING:
+        from vllm import RequestOutput as RequestOutput
+        from vllm_omni.entrypoints.omni import Omni as Omni
+        from vllm_omni.outputs import OmniRequestOutput as OmniRequestOutput
+    else:
+        Omni = object
+        OmniRequestOutput = object
+        RequestOutput = object
+
+    _HAS_OMNI = False
+
+logger = logging.getLogger(__name__)
 
 
 class OmniResult(BaseExecutorResult):
@@ -67,7 +81,7 @@ class OmniExecutorBase(InferenceMixin, Executor):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._omni: Any | None = None
+        self._omni: Omni | None = None
         self._model_name: str | None = None
         self._omni_spec: tuple[Any, ...] | None = None
         self._stage_configs_tmp: Path | None = None
@@ -137,6 +151,7 @@ class OmniExecutorBase(InferenceMixin, Executor):
             cfg.get("log_stats"),
             cfg.get("stage_init_timeout"),
             cfg.get("init_timeout"),
+            cfg.get("async_chunk"),
         )
 
     def _materialize_stage_configs(self, cfg: dict[str, Any]) -> str | None:
@@ -261,6 +276,8 @@ class OmniExecutorBase(InferenceMixin, Executor):
             init_kwargs["stage_configs_path"] = stage_configs_path
         if cfg.get("log_stats") is not None:
             init_kwargs["log_stats"] = to_bool(cfg.get("log_stats"), default=False)
+        if cfg.get("async_chunk") is not None:
+            init_kwargs["async_chunk"] = to_bool(cfg.get("async_chunk"), default=False)
         for key in ("stage_init_timeout", "init_timeout"):
             val = to_int(cfg.get(key))
             if val is not None:
@@ -384,25 +401,20 @@ def write_wav(path: Path, samples: list[float], sample_rate: int) -> None:
 # ── multimodal output extraction (shared by tts, narration) ─────────────────
 
 
-def extract_multimodal_output(value: Any) -> dict[str, Any] | None:
-    if value is None:
+def extract_multimodal_output(
+    output: OmniRequestOutput | None,
+) -> Mapping[str, Any] | None:
+    if output is None:
         return None
-    if isinstance(value, dict):
-        mm = value.get("multimodal_output")
-        return mm if isinstance(mm, dict) else None
-    outputs = getattr(value, "outputs", None)
-    if isinstance(outputs, list) and outputs:
-        mm = getattr(outputs[0], "multimodal_output", None)
-        if isinstance(mm, dict):
-            return mm
-    mm = getattr(value, "multimodal_output", None)
-    return mm if isinstance(mm, dict) else None
+    return mm if isinstance(mm := output.multimodal_output, Mapping) else None
 
 
-def extract_audio_from_mm(mm: dict[str, Any] | None) -> Any:
-    if not isinstance(mm, dict):
+def extract_audio_from_mm(mm: Mapping[str, Any] | None) -> Any:
+    if mm is None:
         return None
     audio = mm.get("audio")
+    if audio is None:
+        audio = mm.get("model_outputs")
     if audio is None:
         return None
     sr = (
@@ -411,4 +423,6 @@ def extract_audio_from_mm(mm: dict[str, Any] | None) -> Any:
         or mm.get("sampling_rate")
         or mm.get("sr")
     )
+    if isinstance(sr, (list, tuple)) and sr:
+        sr = sr[0]
     return {"audio": audio, "sample_rate": sr} if sr is not None else audio

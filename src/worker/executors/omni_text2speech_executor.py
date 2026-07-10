@@ -1,7 +1,7 @@
 """Omni executor for text-to-speech via vllm_omni."""
 
 import logging
-import os
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -10,12 +10,15 @@ from shared.schemas.governance import SpanType
 from shared.tasks.specs import TaskSpecStrictBase
 from shared.tasks.specs.omni import OmniText2SpeechSpecStrict
 from shared.tasks.task_type import TaskType
-from shared.utils.parsing import as_list, to_int
+from shared.utils.parsing import to_int
 
 from .base_executor import ExecutionError, ExecutorTask
+from .omni import qwen3_tts
 from .omni_executor_base import (
     _HAS_OMNI,
+    Omni,
     OmniExecutorBase,
+    OmniRequestOutput,
     OmniResult,
     extract_audio_from_mm,
     extract_multimodal_output,
@@ -114,8 +117,6 @@ class OmniText2SpeechExecutor(OmniExecutorBase):
     # ── model ────────────────────────────────────────────────────────────
 
     def _ensure_omni(self, spec_dict: dict[str, Any]) -> None:
-        from vllm_omni.entrypoints.omni import Omni
-
         cfg = self.omni_cfg(spec_dict, "omni:tts", "omni_text2speech")
         model_name = self.resolve_model_identifier(
             spec_dict,
@@ -123,6 +124,8 @@ class OmniText2SpeechExecutor(OmniExecutorBase):
             env_keys=("OMNI_TTS_MODEL",),
             default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         )
+        if qwen3_tts.is_qwen3_tts(model_name) and cfg.get("async_chunk") is None:
+            cfg = {**cfg, "async_chunk": False}
         new_spec = self._build_omni_spec(model_name, cfg)
         if self._omni is not None:
             if self._omni_spec == new_spec:
@@ -142,76 +145,47 @@ class OmniText2SpeechExecutor(OmniExecutorBase):
     def _generate_single(self, text: str, spec_dict: dict[str, Any]) -> Any:
         if self._omni is None:
             raise ExecutionError("Omni model not initialized.")
+        model_name = str(self._model_name or "")
         prompt = self._build_tts_prompt(text, spec_dict=spec_dict)
-        outputs = self._omni.generate(prompt, use_tqdm=False)
+        sampling_params = (
+            qwen3_tts.build_sampling_params(self._omni)
+            if qwen3_tts.is_qwen3_tts(model_name)
+            else None
+        )
+        outputs = self._omni.generate(
+            prompt, sampling_params_list=sampling_params, use_tqdm=False
+        )
         audio = _extract_first_audio(outputs)
         if audio is None:
-            raise ExecutionError("Omni TTS generation returned no audio.")
+            raise ExecutionError(
+                "Omni TTS generation returned no audio "
+                f"({_summarize_omni_outputs(outputs)})."
+            )
         return audio
 
     def _build_tts_prompt(self, text: str, spec_dict: dict[str, Any]) -> Any:
         model_name = str(self._model_name or "")
-        if "qwen3-tts" not in model_name.strip().lower():
+        if not qwen3_tts.is_qwen3_tts(model_name):
+            # TODO(omni-tts): other vllm_omni TTS families (higgs_audio, ming_tts,
+            # moss_tts, voxcpm2, glm_tts, cosyvoice3, …) each need their own prompt
+            # / additional_information builder — see vllm_omni
+            # entrypoints/openai/serving_speech.py adapters. Until those exist, pass
+            # the raw text, which only drives models that accept a string prompt.
             return text
         cfg = self.omni_cfg(spec_dict, "omni:tts", "omni_text2speech")
         data = spec_dict.get("data") if isinstance(spec_dict.get("data"), dict) else {}
         if not isinstance(data, dict):
             data = {}
-
-        task_type = _resolve_qwen3_tts_task_type(model_name, cfg=cfg, data=data)
-        additional: dict[str, Any] = {
-            "task_type": [task_type],
-            "text": [text],
-            "max_new_tokens": [
-                _resolve_max_new_tokens(
-                    cfg=cfg, data=data, text=text, task_type=task_type
-                )
-            ],
-        }
-        language = str(
-            cfg.get("language")
-            or data.get("language")
-            or os.getenv("OMNI_TTS_LANGUAGE")
-            or "Auto"
-        ).strip()
-        if language:
-            additional["language"] = [language]
-        instruct = str(
-            cfg.get("instruct")
-            or cfg.get("instructions")
-            or data.get("instruct")
-            or data.get("instructions")
-            or ""
-        ).strip()
-        if instruct:
-            additional["instruct"] = [instruct]
-        if task_type == "CustomVoice":
-            speaker = str(
-                cfg.get("speaker")
-                or cfg.get("voice")
-                or data.get("speaker")
-                or data.get("voice")
-                or os.getenv("OMNI_TTS_VOICE")
-                or "Vivian"
-            ).strip()
-            additional["speaker"] = [speaker]
-
-        return {"prompt_token_ids": [0] * 2048, "additional_information": additional}
+        return qwen3_tts.build_prompt(
+            model_name=model_name, text=text, cfg=cfg, data=data
+        )
 
 
 # ── TTS-specific helpers ─────────────────────────────────────────────────────
 
 
-def _extract_first_audio(outputs: Any) -> Any:
-    for stage in as_list(outputs):
-        ros = as_list(getattr(stage, "request_output", None))
-        if ros:
-            for ro in ros:
-                mm = extract_multimodal_output(ro)
-                audio = extract_audio_from_mm(mm)
-                if audio is not None:
-                    return audio
-            continue
+def _extract_first_audio(outputs: Iterable[OmniRequestOutput]) -> Any:
+    for stage in outputs:
         mm = extract_multimodal_output(stage)
         audio = extract_audio_from_mm(mm)
         if audio is not None:
@@ -219,28 +193,36 @@ def _extract_first_audio(outputs: Any) -> Any:
     return None
 
 
-def _resolve_qwen3_tts_task_type(
-    model_name: str, cfg: dict[str, Any], data: dict[str, Any]
-) -> str:
-    explicit = cfg.get("task_type") or data.get("task_type")
-    if isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()
-    lower = model_name.strip().lower()
-    if "-base" in lower:
-        return "Base"
-    if "voicedesign" in lower:
-        return "VoiceDesign"
-    return "CustomVoice"
+def _summarize_omni_outputs(outputs: Iterable[OmniRequestOutput]) -> str:
+    parts: list[str] = []
+    for index, stage in enumerate(outputs):
+        stage_bits = [
+            f"stage[{index}]={type(stage).__name__}",
+            f"stage_id={stage.stage_id!r}",
+            f"final_output_type={stage.final_output_type!r}",
+            f"finished={stage.finished!r}",
+        ]
+        stage_bits.append(f"request_output={_summarize_request_output(stage)}")
+        parts.append(", ".join(stage_bits))
+    return " | ".join(parts) if parts else "outputs=[]"
 
 
-def _resolve_max_new_tokens(
-    cfg: dict[str, Any], data: dict[str, Any], text: str, task_type: str
-) -> int:
-    raw = cfg.get("max_new_tokens")
-    if raw in (None, ""):
-        raw = data.get("max_new_tokens")
-    if raw not in (None, ""):
-        return max(24, to_int(raw, default=512))
-    if task_type in {"CustomVoice", "VoiceDesign"}:
-        return int(max(512, max(192, min(768, len(text.strip()) * 6))))
-    return 2048
+def _summarize_request_output(output: OmniRequestOutput | None) -> str:
+    if output is None:
+        return "None"
+    mm = extract_multimodal_output(output)
+    outputs = output.outputs
+    mm_keys = sorted(mm.keys()) if isinstance(mm, Mapping) else None
+    finish_reason = None
+    output_kind = None
+    if outputs:
+        finish_reason = getattr(outputs[0], "finish_reason", None)
+        output_kind = getattr(outputs[0], "output_kind", None)
+    return (
+        f"ro={type(output).__name__}"
+        f", finished={output.finished!r}"
+        f", outputs={len(outputs) if isinstance(outputs, list) else None!r}"
+        f", finish_reason={finish_reason!r}"
+        f", output_kind={output_kind!r}"
+        f", mm_keys={mm_keys!r}"
+    )
