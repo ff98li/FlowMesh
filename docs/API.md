@@ -83,7 +83,16 @@ calls.
 | GET | `/api/v1/ssh/connections` | List active server-audited SSH proxy/forward connections. |
 
 Server policy toggles: `ENABLE_SERVER_SSH_PROXY`,
-`ENABLE_SERVER_SSH_FORWARD`, `ENABLE_SERVER_SSH_CONNECTION_AUDIT`.
+`ENABLE_SERVER_PORT_FORWARD`, `ENABLE_SERVER_SSH_CONNECTION_AUDIT`.
+
+## Serve
+
+| Method | Path | Description |
+|--------|------|-------------|
+| ANY | `/api/v1/serve/tasks/{task_id}/{upstream_path:path}` | HTTP reverse proxy to a `proxy`-mode serve task's vLLM server. |
+
+PAT-exempt: authenticated solely by the task's vLLM api-key, not a Lumid PAT.
+Gated by `ENABLE_SERVER_SSH_PROXY`, the same toggle as the SSH proxy.
 
 ## System
 

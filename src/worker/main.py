@@ -137,6 +137,7 @@ def initialize_executors(
         "vllm",
         "vllm_lora",
         "vllm_embedding",
+        "vllm_serve",
         "ppo",
         "dpo",
         "omni_text2image",

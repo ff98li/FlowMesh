@@ -23,6 +23,7 @@ EXECUTOR_MODULES: dict[str, tuple[str, str]] = {
     "vllm": ("VLLMExecutor", ".vllm_executor"),
     "vllm_lora": ("VLLMLoRAExecutor", ".vllm_lora_executor"),
     "vllm_embedding": ("VLLMEmbeddingExecutor", ".vllm_embedding_executor"),
+    "vllm_serve": ("VLLMServeExecutor", ".vllm_serve_executor"),
     "ppo": ("PPOExecutor", ".ppo_executor"),
     "dpo": ("DPOExecutor", ".dpo_executor"),
     "sft": ("SFTExecutor", ".sft_executor"),
