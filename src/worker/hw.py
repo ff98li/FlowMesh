@@ -114,38 +114,44 @@ def collect_hw(*, bandwidth_bytes_per_sec: float | None = None) -> WorkerHardwar
     cuda_version: str | None = None
     devices: list[GpuInfo] = []
     unified_memory = False
-    try:
-        pynvml.nvmlInit()
-        raw = pynvml.nvmlSystemGetDriverVersion()
-        driver_version = raw.decode() if isinstance(raw, bytes) else raw
-        cuda_raw = pynvml.nvmlSystemGetCudaDriverVersion()
-        cuda_version = f"{cuda_raw // 1000}.{(cuda_raw % 1000) // 10}"
-        for idx in range(pynvml.nvmlDeviceGetCount()):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
-            name_raw = pynvml.nvmlDeviceGetName(handle)
-            uuid_raw = pynvml.nvmlDeviceGetUUID(handle)
-            name = name_raw.decode() if isinstance(name_raw, bytes) else name_raw
-            uuid = uuid_raw.decode() if isinstance(uuid_raw, bytes) else uuid_raw
-            gpu_uses_unified_memory = _device_uses_unified_memory(idx, name)
-            unified_memory = unified_memory or gpu_uses_unified_memory
-            mem_total: int | None = None
-            if not gpu_uses_unified_memory:
-                try:
-                    mem_total_raw = pynvml.nvmlDeviceGetMemoryInfo(handle).total
-                except pynvml.NVMLError:
-                    mem_total_raw = None
-                if mem_total_raw:
-                    mem_total = int(mem_total_raw)
-            devices.append(
-                GpuInfo(
-                    index=idx,
-                    name=name,
-                    uuid=uuid,
-                    memory_total_bytes=mem_total,
+    collect_gpu = os.environ.get("FLOWMESH_COLLECT_GPU", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    if collect_gpu:
+        try:
+            pynvml.nvmlInit()
+            raw = pynvml.nvmlSystemGetDriverVersion()
+            driver_version = raw.decode() if isinstance(raw, bytes) else raw
+            cuda_raw = pynvml.nvmlSystemGetCudaDriverVersion()
+            cuda_version = f"{cuda_raw // 1000}.{(cuda_raw % 1000) // 10}"
+            for idx in range(pynvml.nvmlDeviceGetCount()):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                name_raw = pynvml.nvmlDeviceGetName(handle)
+                uuid_raw = pynvml.nvmlDeviceGetUUID(handle)
+                name = name_raw.decode() if isinstance(name_raw, bytes) else name_raw
+                uuid = uuid_raw.decode() if isinstance(uuid_raw, bytes) else uuid_raw
+                gpu_uses_unified_memory = _device_uses_unified_memory(idx, name)
+                unified_memory = unified_memory or gpu_uses_unified_memory
+                mem_total: int | None = None
+                if not gpu_uses_unified_memory:
+                    try:
+                        mem_total_raw = pynvml.nvmlDeviceGetMemoryInfo(handle).total
+                    except pynvml.NVMLError:
+                        mem_total_raw = None
+                    if mem_total_raw:
+                        mem_total = int(mem_total_raw)
+                devices.append(
+                    GpuInfo(
+                        index=idx,
+                        name=name,
+                        uuid=uuid,
+                        memory_total_bytes=mem_total,
+                    )
                 )
-            )
-    except pynvml.NVMLError:
-        pass
+        except pynvml.NVMLError:
+            pass
     gpu = GpuPlatformInfo(
         driver_version=driver_version,
         cuda_version=cuda_version,

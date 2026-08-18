@@ -1,4 +1,6 @@
+import os
 import re
+import subprocess
 from enum import StrEnum
 from typing import Any
 
@@ -40,7 +42,12 @@ class ResourceManager:
     _instance: "ResourceManager | None" = None
 
     def __init__(self) -> None:
-        self._docker_client = get_docker_client()
+        try:
+            self._docker_client = get_docker_client()
+        except Exception:
+            # No Docker on this host: fall back to host-level probing so the
+            # native worker provider still works.
+            self._docker_client = None
         self._env = self._detect_machine_env()
 
     @classmethod
@@ -103,8 +110,12 @@ class ResourceManager:
         self._env.available_gpus.update(devices)
 
     def _detect_machine_env(self) -> MachineEnv:
-        info = self._docker_client.info()
-        cpu_count = info.get("NCPU", 0)
+        cpu_count = os.cpu_count() or 0
+        if self._docker_client is not None:
+            try:
+                cpu_count = self._docker_client.info().get("NCPU", cpu_count)
+            except Exception:
+                pass
 
         gpu_families: dict[int, GpuArch] = {}
         available_gpus: set[int] = set()
@@ -123,18 +134,34 @@ class ResourceManager:
         if visible_devices is None or len(visible_devices) > 0:
             # Detect GPUs using nvidia-smi if available
             try:
-                optional_kwargs: dict[str, Any] = {}
-                if env.DOCKER_GPU_RUNTIME is not None:
-                    optional_kwargs["runtime"] = env.DOCKER_GPU_RUNTIME
-                nvidia_smi_output = self._docker_client.containers.run(
-                    image=env.SERVER_CUDA_PROBE_IMAGE,
-                    device_requests=[DeviceRequest(count=-1, capabilities=[["gpu"]])],
-                    command="nvidia-smi --query-gpu=index,name --format=csv,noheader",
-                    remove=True,
-                    **optional_kwargs,
-                )
-                output_str = nvidia_smi_output.decode("utf-8").strip()
+                if self._docker_client is not None:
+                    optional_kwargs: dict[str, Any] = {}
+                    if env.DOCKER_GPU_RUNTIME is not None:
+                        optional_kwargs["runtime"] = env.DOCKER_GPU_RUNTIME
+                    nvidia_smi_output = self._docker_client.containers.run(
+                        image=env.SERVER_CUDA_PROBE_IMAGE,
+                        device_requests=[
+                            DeviceRequest(count=-1, capabilities=[["gpu"]])
+                        ],
+                        command="nvidia-smi --query-gpu=index,name --format=csv,noheader",
+                        remove=True,
+                        **optional_kwargs,
+                    )
+                    output_str = nvidia_smi_output.decode("utf-8").strip()
+                else:
+                    output_str = subprocess.run(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=index,name",
+                            "--format=csv,noheader",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    ).stdout.strip()
                 for line in output_str.split("\n"):
+                    if "," not in line:
+                        continue
                     index_str, name = line.split(",", maxsplit=1)
                     index = int(index_str.strip())
                     if visible_devices is None or index in visible_devices:

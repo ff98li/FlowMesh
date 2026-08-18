@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..hooks import PrincipalContext
 from .adapters.base import ProviderSpec, WorkerAdapter, WorkerTokenType
 from .adapters.docker import get_provider_spec as docker_provider_spec
+from .adapters.native import get_provider_spec as native_provider_spec
 from .adapters.vastai import get_provider_spec as vastai_provider_spec
 from .registry import WorkerRegistry
 from .schemas import WorkerInfo, WorkerStatus
@@ -68,10 +69,23 @@ class WorkerManager:
         self._default_worker_config: dict[str, Any] | None = None
         self._is_started: bool = False
         self._capacity_change_callback = capacity_change_callback
-        specs = [
-            docker_provider_spec(system_principal),
-            vastai_provider_spec(system_principal),
-        ]
+        # Provider specs are built defensively: on hosts without Docker the
+        # docker provider constructor raises (docker.from_env is eager), and
+        # that must not prevent other providers (e.g. `native`) from loading.
+        specs: list[ProviderSpec] = []
+        for builder in (
+            docker_provider_spec,
+            vastai_provider_spec,
+            native_provider_spec,
+        ):
+            try:
+                specs.append(builder(system_principal))
+            except Exception as exc:
+                logger.warning(
+                    "Worker provider %s unavailable: %s",
+                    getattr(builder, "__name__", builder),
+                    exc,
+                )
         self._providers: dict[str, ProviderSpec] = {spec.name: spec for spec in specs}
 
     @property
