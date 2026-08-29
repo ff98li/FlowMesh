@@ -13,7 +13,10 @@ Every endpoint under `/api/v1/*` (REST and WebSocket) authenticates via
 the `Authorization: Bearer <token>` header. The token is routed through
 the registered `IdentityProvider` chain (see `docs/PLUGINS.md`); with
 no providers registered, every caller resolves to a default admin
-principal. After authentication, every resource-scoped endpoint runs
+principal. Set `FLOWMESH_REQUIRE_API_KEY=true` to require a constant-time
+match against a non-empty `FLOWMESH_API_KEY` when no identity provider is
+installed. Missing or incorrect bearer tokens then return 401. After
+authentication, every resource-scoped endpoint runs
 the registered `PermissionChecker` chain; with no checkers registered,
 all calls succeed (open by default). The classification of resource type
 and action per endpoint lives in `src/server/routers/v1/`. Workers
@@ -98,9 +101,18 @@ Gated by `ENABLE_SERVER_SERVE_PROXY`.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/healthz` | Top-level health check. |
+| GET | `/livez` | HTTP-process liveness; does not probe dependencies. |
+| GET | `/readyz` | Redis, registry, supervisor-control and configured minimum-worker readiness. Returns 503 when any check fails. |
+| GET | `/healthz` | Compatibility alias for `/readyz`. |
 | GET | `/api/v1/system/version` | Server version. |
 | GET | `/api/v1/system/metrics` | System metrics snapshot. |
+
+`/readyz` verifies that the supervisor child and its IPC command loop are
+responsive and that registered workers have fresh heartbeats. It does not open
+an extra gRPC channel: a fresh worker registration/heartbeat is the end-to-end
+evidence that the worker-facing gRPC server is functioning. Set
+`FLOWMESH_READY_MIN_WORKERS` to the deployment's required healthy worker count;
+the default `0` supports API-only deployments.
 
 ## Cursor pagination
 

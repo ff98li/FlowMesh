@@ -126,7 +126,7 @@ class WorkerSupervisor:
         )
         self._node_id_watcher.start()
 
-    async def stop(self, timeout: float = 3.0) -> None:
+    async def stop(self, timeout: float = 120.0) -> None:
         """Gracefully stop the supervisor child process."""
         self._node_id_stop = True
         if self._node_id_watcher is not None:
@@ -419,9 +419,11 @@ def _run_supervisor(
         # Publish unregister event early to allow the server to handle before being
         # timed out
         lifecycle.publish_unregister()
-        await grpc_server.stop()
         await command_listener.stop()
         await worker_manager.stop()
+        # Keep gRPC available while workers shut down so their final status and
+        # unregister messages can confirm that a remote process really exited.
+        await grpc_server.stop()
         relay_service.stop()
         await relay_uplink.stop()
         task_listener.stop()

@@ -28,10 +28,10 @@ type ResponseHandler = Callable[[CommandResponse], None]
 _MAX_INFLIGHT_CMDS = 32
 _STOP_DRAIN_TIMEOUT = 10.0
 _START_WORKER_TIMEOUT = 600.0
-_STOP_WORKER_TIMEOUT = 60.0
+_STOP_WORKER_TIMEOUT = 90.0
 _CREATE_WORKER_TIMEOUT = 600.0
-_DESTROY_WORKER_TIMEOUT = 60.0
-_DESTROY_WORKERS_TIMEOUT = 120.0
+_DESTROY_WORKER_TIMEOUT = 90.0
+_DESTROY_WORKERS_TIMEOUT = 150.0
 
 
 def _cmd_receiver_loop(
@@ -515,7 +515,8 @@ class CommandListener:
             success = await asyncio.wait_for(
                 self._wm.destroy_worker(worker_name), timeout=_DESTROY_WORKER_TIMEOUT
             )
-            self._worker_locks.pop(worker_name, None)
+            if success:
+                self._worker_locks.pop(worker_name, None)
             return CommandResponse.ok(cmd, data={"success": success})
         except Exception as exc:
             return CommandResponse.error(cmd, f"Failed to destroy worker: {exc}")

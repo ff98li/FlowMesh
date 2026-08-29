@@ -135,6 +135,7 @@ class VastAIWorkerAdapter(WorkerAdapter):
             name=self.name,
             provider=_PROVIDER_NAME,
             status=self.status,
+            heartbeat_fresh=self.heartbeat_is_fresh(),
             hardware=hardware,
         )
 
@@ -165,8 +166,11 @@ class VastAIWorkerAdapter(WorkerAdapter):
 
     async def stop(self) -> bool:
         prev_status = self.status
-        if prev_status in (WorkerStatus.STOPPING, WorkerStatus.STOPPED):
-            return True
+        if prev_status is WorkerStatus.STOPPING:
+            return False
+        # A prior gRPC disconnect may have set this event without proving that
+        # the remote instance stopped. Require a fresh post-stop confirmation.
+        self._stop_event.clear()
         self.set_status(WorkerStatus.STOPPING)
         try:
             ok = await asyncio.to_thread(self._stop)
@@ -310,6 +314,7 @@ class VastAIWorkerAdapter(WorkerAdapter):
     def _stop(self) -> bool:
         instance_id = self._instance_id
         if instance_id is None:
+            self.set_status(WorkerStatus.STOPPED)
             return True
 
         if self._created_instance:
@@ -333,12 +338,19 @@ class VastAIWorkerAdapter(WorkerAdapter):
                 self.name,
                 err,
             )
-            self._release_reserved_offer()
             return False
-        self._stop_event.wait(self._STOP_TIMEOUT)
+        if not self._stop_event.wait(self._STOP_TIMEOUT):
+            logger.error(
+                "VastAI worker %s did not confirm shutdown within %.0fs; "
+                "retaining its offer reservation.",
+                self.name,
+                self._STOP_TIMEOUT,
+            )
+            return False
         self._release_reserved_offer()
         self._instance_id = None
         self._hardware = self.config.hardware_specs
+        self.set_status(WorkerStatus.STOPPED)
         return True
 
     def _build_env_str(self) -> str:

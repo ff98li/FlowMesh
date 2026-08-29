@@ -1,10 +1,10 @@
 """Minimal auth surface.
 
-FlowMesh ships no native API-key auth. The semantic is:
+FlowMesh supports an opt-in static API-key mode. The semantic is:
 
 - With no `IdentityProvider` plugins registered, `authenticate_api_key`
-  returns a default admin principal — auth is effectively a no-op and every
-  caller is admin.
+  returns a default admin principal unless `FLOWMESH_REQUIRE_API_KEY=true`.
+  Static mode requires an exact `FLOWMESH_API_KEY` bearer match.
 - Once at least one provider is registered, every bearer token is routed
   through the chain in registration order. The first provider returning a
   non-`None` `PrincipalContext` wins; if none claim the token, 401 is raised.
@@ -16,6 +16,7 @@ the registered `PermissionChecker` chain; with no checkers registered both
 helpers short-circuit to "no filter, no gate".
 """
 
+import hmac
 import logging
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -25,6 +26,7 @@ from flowmesh_hook import ResourceAction, ResourceKind
 from lumid_hooks import PrincipalContext, ResourceRef
 from starlette.requests import HTTPConnection
 
+from .. import env
 from ..hooks import IDENTITY_PROVIDERS, PERMISSION_CHECKERS, RESOURCE_REGISTRARS
 
 
@@ -44,11 +46,19 @@ async def authenticate_api_key(
 ) -> PrincipalContext:
     """Resolve a bearer token to a `PrincipalContext` via registered providers.
 
-    With no providers registered, returns `default_principal()` — auth is off,
-    every caller is admin.
+    With no providers registered, returns `default_principal()` unless static
+    bearer authentication is required by the deployment.
     """
     if not IDENTITY_PROVIDERS:
-        return default_principal()
+        if not env.FLOWMESH_REQUIRE_API_KEY:
+            return default_principal()
+        expected = env.FLOWMESH_API_KEY
+        if expected and raw_key and hmac.compare_digest(raw_key, expected):
+            return default_principal()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing bearer token",
+        )
 
     for provider in IDENTITY_PROVIDERS:
         resolved = await provider.resolve(raw_key, logger)
@@ -67,7 +77,12 @@ async def resolve_system_principal(
     """Resolve the principal that represents this server for system-driven actions
     (boot-time worker spawn, supervisor self-registration, heartbeat reaper, etc.)."""
     if not IDENTITY_PROVIDERS:
-        return default_principal()
+        if env.FLOWMESH_REQUIRE_API_KEY and not env.FLOWMESH_API_KEY:
+            raise RuntimeError(
+                "FLOWMESH_API_KEY must be non-empty when "
+                "FLOWMESH_REQUIRE_API_KEY=true"
+            )
+        return await authenticate_api_key(api_key, logger)
     try:
         for provider in IDENTITY_PROVIDERS:
             resolved = await provider.resolve(api_key, logger)

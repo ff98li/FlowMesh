@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -11,8 +12,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import ConfigDict
 
+from ... import env
 from ...hooks import PrincipalContext
 from ..resource_manager import GpuArch, ResourceManager
 from ..schemas import WorkerHardware, WorkerInfo, WorkerStatus
@@ -28,6 +30,48 @@ _STOP_TIMEOUT = 30  # seconds
 _PROVIDER_NAME = "native"
 _HW_PROBE_PREFIX = "HW_PROBE_OUTPUT: "
 _START_GRACE_SECONDS = 1.5
+_INHERITED_ENV_KEYS = frozenset(
+    {
+        "CONDA_DEFAULT_ENV",
+        "CONDA_PREFIX",
+        "CURL_CA_BUNDLE",
+        "CUDA_HOME",
+        "CUDA_PATH",
+        "CUDA_ROOT",
+        "DYLD_LIBRARY_PATH",
+        "HOME",
+        "LANG",
+        "LANGUAGE",
+        "LD_LIBRARY_PATH",
+        "LIBRARY_PATH",
+        "LOGNAME",
+        "MKL_NUM_THREADS",
+        "NVIDIA_DRIVER_CAPABILITIES",
+        "PATH",
+        "REQUESTS_CA_BUNDLE",
+        "SHELL",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "STACK_DEPLOYMENT_ID",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "TORCH_EXTENSIONS_DIR",
+        "USER",
+        "VIRTUAL_ENV",
+    }
+)
+_INHERITED_ENV_PREFIXES = (
+    "FI_",
+    "LC_",
+    "NCCL_",
+    "OMPI_",
+    "OMP_",
+    "PMI_",
+    "PMIX_",
+    "SLURM_",
+    "UCX_",
+)
 
 logger = logging.getLogger("supervisor")
 
@@ -38,6 +82,8 @@ class WorkerType(StrEnum):
 
 
 class NativeWorkerConfig(WorkerConfig):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     worker_type: WorkerType = WorkerType.CPU
     """Type of worker (cpu or gpu)"""
     cuda_devices: list[int] | None = None
@@ -45,14 +91,8 @@ class NativeWorkerConfig(WorkerConfig):
     gpu_count: int = 1
     """Number of GPUs to auto-pick when ``cuda_devices`` is unset
     (only consulted for GPU workers)."""
-    command: list[str] | None = None
-    """Worker process command. Defaults to ``[sys.executable, -m, worker.main]``."""
-    cwd: str | None = None
-    """Working directory for the worker process (defaults to the
-    supervisor's working directory)."""
-    log_dir: str | None = None
-    """Directory for worker stdout/stderr logs (defaults to the heartbeat
-    file directory)."""
+    hb_file: None = None
+    """Native worker heartbeat paths are managed by the supervisor."""
 
     def model_post_init(self, __context: object) -> None:
         super().model_post_init(__context)
@@ -69,22 +109,25 @@ class NativeWorkerAdapter(WorkerAdapter):
         self,
         token: WorkerTokenType,
         name: str,
-        command: list[str],
         cuda_devices: list[int] | None,
+        cuda_device_tokens: list[str] | None,
         gpu_arch: GpuArch | None,
         config: NativeWorkerConfig,
         owner: PrincipalContext,
     ) -> None:
         if config.worker_type == WorkerType.GPU and (
-            cuda_devices is None or len(cuda_devices) == 0
+            cuda_devices is None
+            or len(cuda_devices) == 0
+            or cuda_device_tokens is None
+            or len(cuda_device_tokens) != len(cuda_devices)
         ):
-            raise ValueError("Expected at least one CUDA device for GPU worker.")
+            raise ValueError("Expected a token for every CUDA device on GPU worker.")
 
         super().__init__(token, name, config, owner)
 
         self.config: NativeWorkerConfig
-        self.command = command
         self.cuda_devices = cuda_devices
+        self.cuda_device_tokens = cuda_device_tokens
         self.gpu_arch = gpu_arch
 
         self._proc: subprocess.Popen[bytes] | None = None
@@ -108,6 +151,7 @@ class NativeWorkerAdapter(WorkerAdapter):
             name=self.name,
             provider=_PROVIDER_NAME,
             status=self.status,
+            heartbeat_fresh=self.heartbeat_is_fresh(),
             hardware=hardware,
         )
 
@@ -127,8 +171,8 @@ class NativeWorkerAdapter(WorkerAdapter):
 
     async def stop(self) -> bool:
         prev_status = self.status
-        if prev_status in (WorkerStatus.STOPPING, WorkerStatus.STOPPED):
-            return True
+        if prev_status is WorkerStatus.STOPPING:
+            return False
         self.set_status(WorkerStatus.STOPPING)
         try:
             ok = await asyncio.to_thread(self._stop)
@@ -140,17 +184,38 @@ class NativeWorkerAdapter(WorkerAdapter):
             raise
 
     def _log_path(self) -> str:
-        log_dir = self.config.log_dir
-        if not log_dir:
-            hb_file = self.config.hb_file or os.path.join(
-                os.environ.get("WORKER_HB_DIR", "/tmp"), f"{self.token}.hb"
-            )
-            log_dir = os.path.dirname(hb_file) or "/tmp"
-        os.makedirs(log_dir, exist_ok=True)
-        return os.path.join(log_dir, f"{self.name}.log")
+        runtime_dir = self._runtime_dir()
+        log_dir = runtime_dir / "logs"
+        log_dir.mkdir(mode=0o700, exist_ok=True)
+        resolved = log_dir.resolve()
+        if not resolved.is_relative_to(runtime_dir):
+            raise RuntimeError("Native worker log directory escapes WORKER_HB_DIR")
+        resolved.chmod(0o700)
+        return (resolved / f"{self._token_digest()}.log").as_posix()
+
+    def _heartbeat_path(self) -> str:
+        return (self._runtime_dir() / f"{self._token_digest()}.hb").as_posix()
+
+    def _runtime_dir(self) -> Path:
+        configured_root = Path(env.WORKER_HB_DIR).expanduser().resolve()
+        runtime_dir = configured_root / "native"
+        runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        resolved = runtime_dir.resolve()
+        if not resolved.is_relative_to(configured_root):
+            raise RuntimeError("Native worker runtime directory escapes WORKER_HB_DIR")
+        resolved.chmod(0o700)
+        return resolved
+
+    def _token_digest(self) -> str:
+        return hashlib.sha256(str(self.token).encode()).hexdigest()[:24]
+
+    @staticmethod
+    def _worker_cwd() -> str:
+        return Path(__file__).resolve().parents[3].as_posix()
 
     def _environment(self) -> dict[str, str]:
         environment = self._base_environment()
+        environment["WORKER_HB_FILE"] = self._heartbeat_path()
         # FlowMesh installs no packages (setuptools packages=[]); the worker
         # process resolves `shared`/`worker` imports via PYTHONPATH=src.
         src_dir = str(Path(__file__).resolve().parents[3])
@@ -160,10 +225,14 @@ class NativeWorkerAdapter(WorkerAdapter):
         )
         if self.config.worker_type == WorkerType.GPU:
             assert self.cuda_devices is not None
+            assert self.cuda_device_tokens is not None
             assert self.gpu_arch is not None
-            gpu_ids = ",".join(str(i) for i in self.cuda_devices)
-            environment["CUDA_VISIBLE_DEVICES"] = gpu_ids
-            environment["WORKER_HOST_GPU_ID"] = gpu_ids
+            allocation = ",".join(self.cuda_device_tokens)
+            environment["CUDA_VISIBLE_DEVICES"] = allocation
+            environment["WORKER_HOST_GPU_ID"] = allocation
+            environment["FLOWMESH_VISIBLE_GPU_TOKENS"] = json.dumps(
+                self.cuda_device_tokens
+            )
             environment["WORKER_HOST_GPU_ARCH"] = self.gpu_arch.value
         else:
             # Hide host GPUs from CPU workers so the scheduler cannot route
@@ -173,28 +242,35 @@ class NativeWorkerAdapter(WorkerAdapter):
             environment["FLOWMESH_COLLECT_GPU"] = "0"
         return environment
 
+    def _process_environment(self) -> dict[str, str]:
+        inherited = {
+            key: value
+            for key, value in os.environ.items()
+            if key in _INHERITED_ENV_KEYS or key.startswith(_INHERITED_ENV_PREFIXES)
+        }
+        return inherited | self._environment()
+
     def _start(self) -> bool:
         if self._proc is not None and self._proc.poll() is None:
             logger.warning("Worker process %s is already running.", self.name)
             return True
 
-        cmd = self.command or [sys.executable, "-m", "worker.main"]
+        cmd = [sys.executable, "-m", "worker.main"]
         log_path = self._log_path()
         log_file = open(log_path, "ab")
         try:
-            proc = subprocess.Popen(
+            # The argv and source working directory are fixed by the adapter.
+            proc = subprocess.Popen(  # nosec B603
                 cmd,
-                cwd=self.config.cwd,
-                env={**os.environ, **self._environment()},
+                cwd=self._worker_cwd(),
+                env=self._process_environment(),
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
         except Exception as exc:
             log_file.close()
-            logger.error(
-                "Failed to start native worker %s: %s", self.name, repr(exc)
-            )
+            logger.error("Failed to start native worker %s: %s", self.name, repr(exc))
             return False
 
         self._proc = proc
@@ -218,11 +294,13 @@ class NativeWorkerAdapter(WorkerAdapter):
         proc = self._proc
         if proc is None or proc.poll() is not None:
             self._proc = None
+            self.set_status(WorkerStatus.STOPPED)
             return True
         try:
             os.killpg(proc.pid, signal.SIGTERM)
         except ProcessLookupError:
             self._proc = None
+            self.set_status(WorkerStatus.STOPPED)
             return True
         except Exception as exc:
             logger.error("Failed to signal native worker %s: %s", self.name, repr(exc))
@@ -241,6 +319,7 @@ class NativeWorkerAdapter(WorkerAdapter):
                 pass
             proc.wait(timeout=10)
         self._proc = None
+        self.set_status(WorkerStatus.STOPPED)
         return True
 
     def _probe_hardware(self) -> dict[str, Any] | None:
@@ -250,10 +329,11 @@ class NativeWorkerAdapter(WorkerAdapter):
             cmd.extend(["--bandwidth-bytes-per-sec", str(bandwidth)])
         cmd.extend(["--collect-hw-prefix", _HW_PROBE_PREFIX])
         try:
-            result = subprocess.run(
+            # The argv and source working directory are fixed by the adapter.
+            result = subprocess.run(  # nosec B603
                 cmd,
-                cwd=self.config.cwd,
-                env={**os.environ, **self._environment()},
+                cwd=self._worker_cwd(),
+                env=self._process_environment(),
                 capture_output=True,
                 timeout=120,
             )
@@ -308,15 +388,17 @@ class NativeWorkerFactory(WorkerFactory):
         self, token: WorkerTokenType, config: NativeWorkerConfig
     ) -> NativeWorkerAdapter:
         cuda_devices: list[int] | None
+        cuda_device_tokens: list[str] | None
         gpu_arch: GpuArch | None
         match config.worker_type:
             case WorkerType.CPU:
-                cuda_devices = gpu_arch = None
+                cuda_devices = cuda_device_tokens = gpu_arch = None
             case WorkerType.GPU:
                 cuda_devices, gpu_arch = self._rm.reserve_gpus(
                     devices=config.cuda_devices,
                     n=config.gpu_count if config.cuda_devices is None else None,
                 )
+                cuda_device_tokens = self._rm.get_gpu_tokens(cuda_devices)
             case _:
                 raise ValueError(f"Unsupported worker type: {config.worker_type}")
 
@@ -324,8 +406,8 @@ class NativeWorkerFactory(WorkerFactory):
         return NativeWorkerAdapter(
             token=token,
             name=name,
-            command=list(config.command) if config.command else [],
             cuda_devices=cuda_devices,
+            cuda_device_tokens=cuda_device_tokens,
             gpu_arch=gpu_arch,
             config=config,
             owner=self.system_principal,

@@ -72,6 +72,11 @@ STACK_ENV_SCHEMA = EnvSchema(
                     min_value=1,
                 ),
                 EnvVar(
+                    "SERVER_GRPC_HOST",
+                    "0.0.0.0",
+                    description="Supervisor gRPC bind address.",
+                ),
+                EnvVar(
                     "SERVER_LOG_LEVEL",
                     "INFO",
                     var_type=EnvVarType.LOG_LEVEL,
@@ -307,7 +312,7 @@ STACK_ENV_SCHEMA = EnvSchema(
         EnvSection(
             title="SSH Worker Defaults",
             vars=[
-                EnvVar("ENABLE_SSH_BY_DEFAULT", "true", var_type=EnvVarType.BOOL),
+                EnvVar("ENABLE_SSH_BY_DEFAULT", "false", var_type=EnvVarType.BOOL),
                 EnvVar("SSH_DEFAULT_IMAGE"),
                 EnvVar("SSH_DEFAULT_USER"),
                 EnvVar("SSH_DEFAULT_TTL_SEC", var_type=EnvVarType.FLOAT, min_value=0),
@@ -427,6 +432,12 @@ STACK_ENV_SCHEMA = EnvSchema(
                     var_type=EnvVarType.INT,
                     min_value=0,
                 ),
+                EnvVar(
+                    "FLOWMESH_READY_MIN_WORKERS",
+                    "0",
+                    var_type=EnvVarType.INT,
+                    min_value=0,
+                ),
             ],
         ),
         EnvSection(
@@ -506,6 +517,22 @@ STACK_ENV_SCHEMA = EnvSchema(
                     "the server",
                 ),
                 EnvVar(
+                    "FLOWMESH_REQUIRE_API_KEY",
+                    "false",
+                    var_type=EnvVarType.BOOL,
+                    description=(
+                        "Require FLOWMESH_API_KEY when no identity plugin is installed."
+                    ),
+                ),
+                EnvVar(
+                    "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES",
+                    "false",
+                    var_type=EnvVarType.BOOL,
+                    description=(
+                        "Allow dynamic workers to override privileged provider fields."
+                    ),
+                ),
+                EnvVar(
                     "NEBULA_API_BASE_URL",
                     var_type=EnvVarType.URL,
                     url_schemes={"http", "https"},
@@ -521,7 +548,13 @@ STACK_ENV_SCHEMA = EnvSchema(
                     description="Optional Docker runtime name for GPU containers.",
                 ),
                 EnvVar(
-                    "CUDA_VISIBLE_DEVICES", "all", var_type=EnvVarType.CSV_INTS_OR_ALL
+                    "CUDA_VISIBLE_DEVICES",
+                    "all",
+                    var_type=EnvVarType.CSV,
+                    description=(
+                        "Allocated GPU indices, GPU UUIDs, or MIG UUIDs; use all "
+                        "when unrestricted."
+                    ),
                 ),
                 EnvVar("WORKER_UPLOAD_RESULTS", "false", var_type=EnvVarType.BOOL),
                 EnvVar(

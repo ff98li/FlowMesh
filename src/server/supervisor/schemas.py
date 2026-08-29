@@ -24,6 +24,9 @@ class WorkerInfo(BaseModel):
     node_alias: str = Field(default=env.NODE_ALIAS, description="Node alias")
     provider: Annotated[str, Field(description="Worker provider")]
     status: Annotated[WorkerStatus, Field(description="Current worker status")]
+    heartbeat_fresh: bool = Field(
+        default=False, description="Whether the local supervisor saw a fresh heartbeat"
+    )
     hardware: Annotated[
         WorkerHardware | None, Field(default=None, description="Hardware metadata")
     ]

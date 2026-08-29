@@ -265,6 +265,17 @@ class TestHandleDestroyWorkerCmd:
         assert resp.success
         self.cl._wm.destroy_worker.assert_called_once_with("worker-abc123")
 
+    def test_failed_destroy_keeps_worker_lock(self) -> None:
+        self.cl._wm.destroy_worker = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        lock = asyncio.Lock()
+        self.cl._worker_locks["worker-abc123"] = lock
+
+        resp = self._handle({"worker_name": "worker-abc123"})
+
+        assert resp.success
+        assert resp.data == {"success": False}
+        assert self.cl._worker_locks["worker-abc123"] is lock
+
 
 # ------------------------------------------------------------------ #
 # Parallel dispatch — different workers run concurrently; same-worker

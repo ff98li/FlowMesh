@@ -40,7 +40,7 @@ The runtime is two top-level processes:
    workflow / task / dispatch logic and the **Supervisor subsystem**
    (`src/server/supervisor/`), which manages per-node worker lifecycle,
    runs the worker-facing gRPC server (`:50051`), and drives the
-   Docker / Vast.ai worker adapters.
+   Docker / Vast.ai / native-process worker adapters.
 2. **Worker** (`src/worker/`) — stateless executor. Connects to a
    supervisor via gRPC, receives tasks, runs the matching executor,
    reports results.

@@ -230,7 +230,10 @@ class SupervisorServicer(supervisor_pb2_grpc.SupervisorServicer):
             match payload.get("type"):
                 case "REGISTER":
                     registered = True
+                    worker.mark_heartbeat()
                     worker.set_status(WorkerStatus.RUNNING)
+                case "HEARTBEAT":
+                    worker.mark_heartbeat()
                 case "UNREGISTER":
                     unregistered = True
             self._relay_service.add_event(payload)

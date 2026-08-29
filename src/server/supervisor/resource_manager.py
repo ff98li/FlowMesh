@@ -1,14 +1,18 @@
 import os
 import re
+import shutil
 import subprocess
 from enum import StrEnum
 from typing import Any
 
+from docker import DockerClient
 from docker.types import DeviceRequest
 from pydantic import BaseModel
 
 from .. import env
 from ..utils.helpers import get_docker_client
+
+_MIG_UUID_RE = re.compile(r"^MIG-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
 
 
 class GpuArch(StrEnum):
@@ -31,6 +35,7 @@ class GpuArch(StrEnum):
 class MachineEnv(BaseModel):
     cpu_count: int
     gpu_families: dict[int, GpuArch]
+    gpu_tokens: dict[int, str]
     available_gpus: set[int]
 
     @property
@@ -42,6 +47,7 @@ class ResourceManager:
     _instance: "ResourceManager | None" = None
 
     def __init__(self) -> None:
+        self._docker_client: DockerClient | None
         try:
             self._docker_client = get_docker_client()
         except Exception:
@@ -61,6 +67,13 @@ class ResourceManager:
 
     def available_gpu_count(self) -> int:
         return len(self._env.available_gpus)
+
+    def get_gpu_tokens(self, devices: list[int]) -> list[str]:
+        """Return parent-allocation tokens for allocation-relative slots."""
+        try:
+            return [self._env.gpu_tokens[device] for device in devices]
+        except KeyError as exc:
+            raise ValueError(f"Unknown GPU allocation slot: {exc.args[0]}") from exc
 
     def reserve_gpus(
         self, devices: list[int] | None = None, n: int | None = None
@@ -117,61 +130,112 @@ class ResourceManager:
             except Exception:
                 pass
 
+        inventory = self._probe_gpu_inventory()
+        allocation_tokens = self._allocation_tokens(inventory)
         gpu_families: dict[int, GpuArch] = {}
+        gpu_tokens: dict[int, str] = {}
         available_gpus: set[int] = set()
 
-        visible_devices: set[int] | None
-        if env.CUDA_VISIBLE_DEVICES is None:
-            visible_devices = None
-        else:
-            try:
-                visible_devices = {
-                    int(dev.strip()) for dev in env.CUDA_VISIBLE_DEVICES.split(",")
-                }
-            except Exception:
-                visible_devices = set()
-
-        if visible_devices is None or len(visible_devices) > 0:
-            # Detect GPUs using nvidia-smi if available
-            try:
-                if self._docker_client is not None:
-                    optional_kwargs: dict[str, Any] = {}
-                    if env.DOCKER_GPU_RUNTIME is not None:
-                        optional_kwargs["runtime"] = env.DOCKER_GPU_RUNTIME
-                    nvidia_smi_output = self._docker_client.containers.run(
-                        image=env.SERVER_CUDA_PROBE_IMAGE,
-                        device_requests=[
-                            DeviceRequest(count=-1, capabilities=[["gpu"]])
-                        ],
-                        command="nvidia-smi --query-gpu=index,name --format=csv,noheader",
-                        remove=True,
-                        **optional_kwargs,
-                    )
-                    output_str = nvidia_smi_output.decode("utf-8").strip()
-                else:
-                    output_str = subprocess.run(
-                        [
-                            "nvidia-smi",
-                            "--query-gpu=index,name",
-                            "--format=csv,noheader",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    ).stdout.strip()
-                for line in output_str.split("\n"):
-                    if "," not in line:
-                        continue
-                    index_str, name = line.split(",", maxsplit=1)
-                    index = int(index_str.strip())
-                    if visible_devices is None or index in visible_devices:
-                        available_gpus.add(index)
-                        gpu_families[index] = GpuArch.from_name(name)
-            except Exception:
-                pass
+        for slot, token in enumerate(allocation_tokens):
+            gpu_tokens[slot] = token
+            gpu_families[slot] = self._arch_for_token(token, inventory)
+            available_gpus.add(slot)
 
         return MachineEnv(
             cpu_count=cpu_count,
             gpu_families=gpu_families,
+            gpu_tokens=gpu_tokens,
             available_gpus=available_gpus,
         )
+
+    def _probe_gpu_inventory(self) -> list[tuple[int, str, str]]:
+        try:
+            if self._docker_client is not None:
+                optional_kwargs: dict[str, Any] = {}
+                if env.DOCKER_GPU_RUNTIME is not None:
+                    optional_kwargs["runtime"] = env.DOCKER_GPU_RUNTIME
+                raw_output = self._docker_client.containers.run(
+                    image=env.SERVER_CUDA_PROBE_IMAGE,
+                    device_requests=[DeviceRequest(count=-1, capabilities=[["gpu"]])],
+                    command=(
+                        "nvidia-smi --query-gpu=index,uuid,name "
+                        "--format=csv,noheader"
+                    ),
+                    remove=True,
+                    **optional_kwargs,
+                )
+                output = raw_output.decode("utf-8").strip()
+            else:
+                nvidia_smi = shutil.which("nvidia-smi")
+                if nvidia_smi is None:
+                    return []
+                # The executable is resolved to an absolute trusted utility path.
+                result = subprocess.run(  # nosec B603
+                    [
+                        nvidia_smi,
+                        "--query-gpu=index,uuid,name",
+                        "--format=csv,noheader",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                output = result.stdout.strip() if result.returncode == 0 else ""
+        except Exception:
+            return []
+
+        inventory: list[tuple[int, str, str]] = []
+        for line in output.splitlines():
+            fields = [field.strip() for field in line.split(",", maxsplit=2)]
+            if len(fields) != 3:
+                continue
+            try:
+                index = int(fields[0])
+            except ValueError:
+                continue
+            inventory.append((index, fields[1], fields[2]))
+        return inventory
+
+    @staticmethod
+    def _allocation_tokens(inventory: list[tuple[int, str, str]]) -> list[str]:
+        raw = env.CUDA_VISIBLE_DEVICES
+        if raw is None:
+            return [str(index) for index, _, _ in sorted(inventory)]
+        tokens = [token.strip() for token in raw.split(",") if token.strip()]
+        if not inventory or len(tokens) != len(set(tokens)):
+            return []
+        inventory_indices = {index for index, _, _ in inventory}
+        inventory_uuids = {uuid for _, uuid, _ in inventory if uuid}
+        non_mig_count = 0
+        for token in tokens:
+            if token.isdecimal():
+                if int(token) not in inventory_indices:
+                    return []
+                non_mig_count += 1
+                continue
+            if token.startswith("GPU-"):
+                if token not in inventory_uuids:
+                    return []
+                non_mig_count += 1
+                continue
+            if token.startswith("MIG-GPU-"):
+                if not any(uuid in token for uuid in inventory_uuids):
+                    return []
+                continue
+            # Recent drivers use opaque MIG UUIDs that do not contain their
+            # parent GPU UUID. A successful inventory probe plus the strict
+            # prefix is the strongest portable validation available here.
+            if _MIG_UUID_RE.fullmatch(token):
+                continue
+            return []
+        if non_mig_count > len(inventory):
+            return []
+        return tokens
+
+    @staticmethod
+    def _arch_for_token(token: str, inventory: list[tuple[int, str, str]]) -> GpuArch:
+        for index, uuid, name in inventory:
+            if token == str(index) or token == uuid or uuid in token:
+                return GpuArch.from_name(name)
+        return GpuArch.UNKNOWN

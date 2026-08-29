@@ -20,6 +20,7 @@ listed here is in `.env.example`.
 | `SERVER_RESULTS_DIR` | `flowmesh_results` | Host-side directory/docker volume to mount at `RESULTS_DIR` in the server container |
 | `WORKER_RESULTS_DIR` | `flowmesh_results` | Server-side directory/docker volume to mount to worker containers |
 | `SERVER_HTTP_PORT` | `8000` | Public HTTP port |
+| `SERVER_GRPC_HOST` | `0.0.0.0` | Supervisor gRPC bind address; use `127.0.0.1` for a single-node local-only deployment |
 | `SERVER_GRPC_PORT` | `50051` | Supervisor gRPC port |
 | `ORCHESTRATOR_DISPATCH_MODE` | `adaptive` | Scheduler mode |
 | `ORCHESTRATOR_WORKER_SELECTION` | `best_fit` | `best_fit`, `first_fit`, `min_satisfying` |
@@ -40,7 +41,10 @@ listed here is in `.env.example`.
 | `FLOWMESH_PLUGIN_DATA_DIR` | `./plugin-data` | Writable mount at `/app/plugin-data` for plugin state. A path -> host bind-mount (auto-created); a bare name -> external Docker volume of that name. |
 | `SERVER_CUDA_PROBE_IMAGE` | `nvidia/cuda:12.9.1-base-ubuntu24.04` | CUDA image the server runs briefly to query local GPU names/indices |
 | `DOCKER_GPU_RUNTIME` | nvidia | Optional Docker runtime name for GPU probe/worker containers; leave empty unless the host requires a named runtime such as `nvidia` |
-| `FLOWMESH_API_KEY` | – | Forwarded to spawned workers as their server-callback bearer |
+| `FLOWMESH_API_KEY` | – | Forwarded to spawned workers as their server-callback bearer; also the expected static bearer when static auth is required |
+| `FLOWMESH_REQUIRE_API_KEY` | `false` | Require `FLOWMESH_API_KEY` bearer authentication when no IdentityProvider plugin is installed |
+| `FLOWMESH_READY_MIN_WORKERS` | `0` | Minimum number of non-stale IDLE/BUSY workers required by `/readyz` and `/healthz` |
+| `FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES` | `false` | Allow dynamic worker requests to set host paths, image identity, Docker SSH/socket access, or container identity; keep disabled for shared deployments |
 | `ENABLE_PERSISTENT_PORT_FORWARD` | `true` | Keep port-forward listeners bound between task sessions; disable to bind listeners only for active sessions |
 | `ENABLE_SERVER_SSH_PROXY` | `true` | Enable the WebSocket proxy for interactive SSH tasks |
 | `ENABLE_SERVER_SERVE_PROXY` | `true` | Enable the HTTP reverse proxy for `serve` tasks |
@@ -61,6 +65,51 @@ not interfere with each other.
 - `DOCKER_GPU_RUNTIME` defaults to `nvidia`. On hosts where Docker GPU access
 works with `--gpus all` but fails with `--runtime=nvidia` (for example, DGX
 Spark), set `DOCKER_GPU_RUNTIME=` in the stack env.
+
+## Worker provider safety
+
+Dynamic Docker-worker requests accept only resource selection and metadata:
+`worker_type`, `gpu_count`, `cuda_devices`, `worker_alias`, `tags`,
+`network_bandwidth`, and `worker_cost_per_hour`. Host bind paths, image
+registry/version, SSH/socket access, and container names must come from the
+operator-owned worker configuration. Native requests use the same allowlist.
+Docker display aliases are kept separate from generated container identities,
+so an alias cannot select and force-remove an unrelated stopped container.
+Vast.ai requests accept bounded offer-selection fields (`disk`, `order`,
+`search_limit`, and `label`) plus non-privileged metadata, but cannot replace
+the operator's trusted-offer constraints, select an existing instance, replace
+the configured image, redirect the supervisor connection, choose host paths,
+or inject credentials. The privileged override switch above disables these
+request-layer safeguards and should only be used on a separately authenticated
+administrative control plane.
+Dynamic requests also cannot choose their gRPC worker token; the supervisor
+generates an unpredictable token after validation.
+Stack scaffolding leaves `ENABLE_SSH_BY_DEFAULT=false`; enable it only in an
+operator-owned deployment configuration that intentionally grants workers
+access to the Docker socket.
+
+Native workers always execute the current Python interpreter with
+`-m worker.main` from FlowMesh's source directory. API/config payloads cannot
+replace the command, working directory, heartbeat file, or log directory.
+Native logs are placed under the operator-configured `WORKER_HB_DIR`.
+Heartbeat and log filenames are derived from a digest rather than a
+request-supplied worker token or alias.
+Native child processes inherit only a runtime allowlist (for example PATH,
+locale, CUDA/HPC runtime, TLS certificate, temporary-directory and Slurm
+metadata variables) plus FlowMesh's explicit worker environment. Unrelated
+supervisor environment variables are not copied into workers.
+
+For native GPU workers, `cuda_devices` contains allocation-relative slots, not
+host-global GPU numbers. FlowMesh preserves the parent
+`CUDA_VISIBLE_DEVICES` tokens, including GPU UUID and MIG UUID forms, and maps
+slot `0` to the first token in that allocation. Omitting `cuda_devices` and
+setting `gpu_count` is preferred for scheduler-managed allocations.
+
+Provider stop must confirm the native process, Docker container, or Vast.ai
+instance has exited before FlowMesh releases an in-process GPU/offer
+reservation. This quarantine state is not durable across a supervisor crash or
+restart; deployments must still use Slurm/cgroup cleanup and reconcile orphaned
+remote instances after abnormal termination.
 
 ## Worker
 

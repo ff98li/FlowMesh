@@ -4,6 +4,7 @@
 Collects lightweight CPU/memory/GPU/network information for registration.
 """
 
+import json
 import os
 import platform
 import re
@@ -26,6 +27,39 @@ from shared.tasks.worker_message import (
 
 _UNIFIED_GPU_NAME_PATTERN = re.compile(r"\b(?:gb10|tegra|thor)\b", re.IGNORECASE)
 _CUDA_DEV_ATTR_INTEGRATED = 18
+
+
+def _visible_gpu_tokens() -> list[str] | None:
+    raw = os.environ.get("FLOWMESH_VISIBLE_GPU_TOKENS")
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list) or not all(
+        isinstance(token, str) and token for token in parsed
+    ):
+        return []
+    return parsed
+
+
+def _nvml_device_handles() -> list[object]:
+    tokens = _visible_gpu_tokens()
+    if tokens is None:
+        return [
+            pynvml.nvmlDeviceGetHandleByIndex(index)
+            for index in range(pynvml.nvmlDeviceGetCount())
+        ]
+
+    handles: list[object] = []
+    for token in tokens:
+        if token.isdecimal():
+            handle = pynvml.nvmlDeviceGetHandleByIndex(int(token))
+        else:
+            handle = pynvml.nvmlDeviceGetHandleByUUID(token)
+        handles.append(handle)
+    return handles
 
 
 def _is_unified_memory_gpu(name: str) -> bool:
@@ -126,13 +160,14 @@ def collect_hw(*, bandwidth_bytes_per_sec: float | None = None) -> WorkerHardwar
             driver_version = raw.decode() if isinstance(raw, bytes) else raw
             cuda_raw = pynvml.nvmlSystemGetCudaDriverVersion()
             cuda_version = f"{cuda_raw // 1000}.{(cuda_raw % 1000) // 10}"
-            for idx in range(pynvml.nvmlDeviceGetCount()):
-                handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            for logical_index, handle in enumerate(_nvml_device_handles()):
                 name_raw = pynvml.nvmlDeviceGetName(handle)
                 uuid_raw = pynvml.nvmlDeviceGetUUID(handle)
                 name = name_raw.decode() if isinstance(name_raw, bytes) else name_raw
                 uuid = uuid_raw.decode() if isinstance(uuid_raw, bytes) else uuid_raw
-                gpu_uses_unified_memory = _device_uses_unified_memory(idx, name)
+                gpu_uses_unified_memory = _device_uses_unified_memory(
+                    logical_index, name
+                )
                 unified_memory = unified_memory or gpu_uses_unified_memory
                 mem_total: int | None = None
                 if not gpu_uses_unified_memory:
@@ -144,7 +179,7 @@ def collect_hw(*, bandwidth_bytes_per_sec: float | None = None) -> WorkerHardwar
                         mem_total = int(mem_total_raw)
                 devices.append(
                     GpuInfo(
-                        index=idx,
+                        index=logical_index,
                         name=name,
                         uuid=uuid,
                         memory_total_bytes=mem_total,

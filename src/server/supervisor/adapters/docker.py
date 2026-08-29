@@ -206,21 +206,26 @@ class DockerWorkerAdapter(WorkerAdapter):
         name: str,
         container_name: str,
         cuda_devices: list[int] | None,
+        cuda_device_tokens: list[str] | None,
         gpu_arch: GpuArch | None,
         config: DockerWorkerConfig,
         docker_client: DockerClient,
         owner: PrincipalContext,
     ) -> None:
         if config.worker_type == WorkerType.GPU and (
-            cuda_devices is None or len(cuda_devices) == 0
+            cuda_devices is None
+            or len(cuda_devices) == 0
+            or cuda_device_tokens is None
+            or len(cuda_device_tokens) != len(cuda_devices)
         ):
-            raise ValueError("Expected at least one CUDA device for GPU worker.")
+            raise ValueError("Expected a token for every CUDA device on GPU worker.")
 
         super().__init__(token, name, config, owner)
 
         self.config: DockerWorkerConfig
         self.container_name = container_name
         self.cuda_devices = cuda_devices
+        self.cuda_device_tokens = cuda_device_tokens
         self.gpu_arch = gpu_arch
 
         self._docker = docker_client
@@ -244,6 +249,7 @@ class DockerWorkerAdapter(WorkerAdapter):
             name=self.name,
             provider=_PROVIDER_NAME,
             status=self.status,
+            heartbeat_fresh=self.heartbeat_is_fresh(),
             hardware=hardware,
             ssh_limits=self.config.ssh.to_limits() if self.config.enable_ssh else None,
         )
@@ -264,8 +270,8 @@ class DockerWorkerAdapter(WorkerAdapter):
 
     async def stop(self) -> bool:
         prev_status = self.status
-        if prev_status in (WorkerStatus.STOPPING, WorkerStatus.STOPPED):
-            return True
+        if prev_status is WorkerStatus.STOPPING:
+            return False
         self.set_status(WorkerStatus.STOPPING)
         try:
             ok = await asyncio.to_thread(self._stop)
@@ -425,6 +431,7 @@ class DockerWorkerAdapter(WorkerAdapter):
             container = self._docker.containers.get(self.container_name)
         except NotFound:
             self._is_started = False
+            self.set_status(WorkerStatus.STOPPED)
             if is_started:
                 logger.warning("Container %s not found.", self.container_name)
             return True
@@ -444,6 +451,7 @@ class DockerWorkerAdapter(WorkerAdapter):
             container.stop(timeout=_STOP_TIMEOUT)
             container.remove()
             self._is_started = False
+            self.set_status(WorkerStatus.STOPPED)
             return True
         except Exception as exc:
             log_fn = logger.error if is_started else logger.warning
@@ -551,12 +559,12 @@ class DockerWorkerAdapter(WorkerAdapter):
                 runtime = None
             case WorkerType.GPU:
                 assert self.cuda_devices is not None
+                assert self.cuda_device_tokens is not None
                 assert self.gpu_arch is not None
                 environment["CUDA_VISIBLE_DEVICES"] = ",".join(
                     str(i) for i in range(len(self.cuda_devices))
                 )
-                cuda_devices_str = [str(i) for i in self.cuda_devices]
-                gpu_ids = ",".join(cuda_devices_str)
+                gpu_ids = ",".join(self.cuda_device_tokens)
                 environment["WORKER_HOST_GPU_ID"] = gpu_ids
                 gpu_arch = self.gpu_arch.value
                 environment["WORKER_HOST_GPU_ARCH"] = gpu_arch
@@ -565,7 +573,9 @@ class DockerWorkerAdapter(WorkerAdapter):
                     labels["flowmesh.worker.gpu_id"] = gpu_ids
                     labels["flowmesh.worker.gpu_arch"] = gpu_arch
                 device_requests = [
-                    DeviceRequest(device_ids=cuda_devices_str, capabilities=[["gpu"]])
+                    DeviceRequest(
+                        device_ids=self.cuda_device_tokens, capabilities=[["gpu"]]
+                    )
                 ]
                 runtime = env.DOCKER_GPU_RUNTIME
             case _:
@@ -711,27 +721,33 @@ class DockerWorkerFactory(WorkerFactory):
         self, token: WorkerTokenType, config: DockerWorkerConfig
     ) -> DockerWorkerAdapter:
         cuda_devices: list[int] | None
+        cuda_device_tokens: list[str] | None
         gpu_arch: GpuArch | None
         match config.worker_type:
             case WorkerType.CPU:
-                cuda_devices = gpu_arch = None
+                cuda_devices = cuda_device_tokens = gpu_arch = None
             case WorkerType.GPU:
                 cuda_devices, gpu_arch = self._rm.reserve_gpus(
                     devices=config.cuda_devices,
                     n=config.gpu_count if config.cuda_devices is None else None,
                 )
+                cuda_device_tokens = self._rm.get_gpu_tokens(cuda_devices)
 
         name = self._resolve_worker_name(config)
-        container_name = (
-            config.container_name
-            if config.container_name
-            else self._sanitize_container_name(name, config)
-        )
+        if config.container_name:
+            container_name = config.container_name
+        elif config.worker_alias:
+            # A caller-controlled display alias must not become Docker object
+            # identity: _start() may remove a stopped container with this name.
+            container_name = self._get_next_worker_name(config.worker_type)
+        else:
+            container_name = self._sanitize_container_name(name, config)
         worker = DockerWorkerAdapter(
             token=token,
             name=name,
             container_name=container_name,
             cuda_devices=cuda_devices,
+            cuda_device_tokens=cuda_device_tokens,
             gpu_arch=gpu_arch,
             config=config,
             docker_client=self._docker,
