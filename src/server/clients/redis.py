@@ -262,12 +262,21 @@ class SyncRedisClient:
             )
             client.ping()
         except Exception as exc:
-            self.logger.exception(
-                "Failed to connect to %s Redis (%s): %s", label, url, exc
+            # Some client/transport exceptions echo their constructor input.
+            # Log only the exception type so credentials cannot re-enter via
+            # either the URL argument or a traceback message.
+            self.logger.error(
+                "Failed to connect to %s Redis (%s): %s",
+                label,
+                _redact_url(url),
+                type(exc).__name__,
             )
-            raise SystemExit(1) from exc
-        self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
-        return client
+        else:
+            self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
+            return client
+        # Raise after leaving the handler so a credential-bearing exception is
+        # not retained as SystemExit.__context__ for a future crash reporter.
+        raise SystemExit(1)
 
     # ---- String helpers ----
     def get(self, key: str) -> str | None:
@@ -413,9 +422,14 @@ class SyncRedisClient:
     # ---- Maintenance ----
     def flush_all(self) -> None:
         self._control.flushdb()
-        self.logger.info("Cleared Redis database at %s (control)", self.control_url)
+        self.logger.info(
+            "Cleared Redis database at %s (control)", _redact_url(self.control_url)
+        )
         self._telemetry.flushdb()
-        self.logger.info("Cleared Redis database at %s (telemetry)", self.telemetry_url)
+        self.logger.info(
+            "Cleared Redis database at %s (telemetry)",
+            _redact_url(self.telemetry_url),
+        )
 
 
 def _awaitable[T](value: Awaitable[T] | T) -> Awaitable[T]:
@@ -468,12 +482,19 @@ class AsyncRedisClient:
                 url, decode_responses=True, **_keepalive_kwargs(), **ssl_kwargs
             )
         except Exception as exc:
-            self.logger.exception(
-                "Failed to connect to %s Redis (%s): %s", label, url, exc
+            # See the synchronous path above: exception text is untrusted and
+            # may repeat a credential-bearing connection URL.
+            self.logger.error(
+                "Failed to connect to %s Redis (%s): %s",
+                label,
+                _redact_url(url),
+                type(exc).__name__,
             )
-            raise SystemExit(1) from exc
-        self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
-        return client
+        else:
+            self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
+            return client
+        # Match the synchronous path and deliberately discard exception text.
+        raise SystemExit(1)
 
     # ---- String helpers ----
     async def get(self, key: str) -> str | None:
@@ -639,9 +660,14 @@ class AsyncRedisClient:
 
     async def flush_all(self) -> None:
         await self._control.flushdb()
-        self.logger.info("Cleared Redis database at %s (control)", self.control_url)
+        self.logger.info(
+            "Cleared Redis database at %s (control)", _redact_url(self.control_url)
+        )
         await self._telemetry.flushdb()
-        self.logger.info("Cleared Redis database at %s (telemetry)", self.telemetry_url)
+        self.logger.info(
+            "Cleared Redis database at %s (telemetry)",
+            _redact_url(self.telemetry_url),
+        )
 
 
 class RedisClient:

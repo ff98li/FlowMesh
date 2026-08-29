@@ -21,6 +21,7 @@ SERVER_APP_PORT: int = int(
     or "8000"
 )
 SERVER_GRPC_PORT: int = int(os.getenv("SERVER_GRPC_PORT") or "50051")
+SERVER_GRPC_HOST: str = os.getenv("SERVER_GRPC_HOST") or SERVER_BIND_HOST
 
 SERVER_GRPC_TLS_CA_FILE: str = (os.getenv("SERVER_GRPC_TLS_CA_FILE") or "").strip()
 SERVER_GRPC_TLS_CERT_FILE: str = (os.getenv("SERVER_GRPC_TLS_CERT_FILE") or "").strip()
@@ -56,6 +57,11 @@ else:
 
 FLOWMESH_BASE_URL: str = os.getenv("FLOWMESH_BASE_URL", "http://localhost:8000")
 FLOWMESH_API_KEY: str = os.getenv("FLOWMESH_API_KEY", "")
+FLOWMESH_REQUIRE_API_KEY: bool = parse_bool_env("FLOWMESH_REQUIRE_API_KEY", False)
+FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES: bool = parse_bool_env(
+    "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES", False
+)
+FLOWMESH_READY_MIN_WORKERS: int = max(0, parse_int_env("FLOWMESH_READY_MIN_WORKERS", 0))
 
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 REDIS_ACL_ENABLED = parse_bool_env("REDIS_ACL_ENABLED", False)

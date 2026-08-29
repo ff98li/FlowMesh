@@ -86,7 +86,7 @@ class GrpcConfig:
     @classmethod
     def from_env(cls) -> "GrpcConfig":
         return cls(
-            host="0.0.0.0",
+            host=os.getenv("SERVER_GRPC_HOST", "0.0.0.0"),
             port=int(os.getenv("SERVER_GRPC_PORT") or "50051"),
             tls_ca_file=(os.getenv("SERVER_GRPC_TLS_CA_FILE") or "").strip(),
             tls_cert_file=(os.getenv("SERVER_GRPC_TLS_CERT_FILE") or "").strip(),

@@ -26,6 +26,7 @@ from flowmesh_hook import (
 )
 from lumid_hooks import PrincipalContext, ResourceRef
 
+from server import env
 from server.auth.security import (
     authenticate_api_key,
     authenticate_connection,
@@ -34,6 +35,7 @@ from server.auth.security import (
     register_resource,
     require_permission,
     resolve_accessible_ids,
+    resolve_system_principal,
 )
 from server.hooks import (
     IDENTITY_PROVIDERS,
@@ -96,6 +98,43 @@ class TestIdentityProviderWiring:
 
         assert principal.principal_type == "admin"
         assert principal.scopes == ["*"]
+
+    @pytest.mark.anyio
+    async def test_required_static_key_accepts_exact_bearer(
+        self, logger: logging.Logger, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(env, "FLOWMESH_REQUIRE_API_KEY", True)
+        monkeypatch.setattr(env, "FLOWMESH_API_KEY", "expected-key")
+
+        principal = await authenticate_api_key("expected-key", logger)
+
+        assert principal.principal_type == "admin"
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("raw_key", ["", "wrong-key"])
+    async def test_required_static_key_rejects_missing_or_wrong_bearer(
+        self,
+        logger: logging.Logger,
+        monkeypatch: pytest.MonkeyPatch,
+        raw_key: str,
+    ) -> None:
+        monkeypatch.setattr(env, "FLOWMESH_REQUIRE_API_KEY", True)
+        monkeypatch.setattr(env, "FLOWMESH_API_KEY", "expected-key")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await authenticate_api_key(raw_key, logger)
+
+        assert exc_info.value.status_code == status.HTTP_401_UNAUTHORIZED
+
+    @pytest.mark.anyio
+    async def test_required_static_key_fails_startup_when_key_is_empty(
+        self, logger: logging.Logger, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(env, "FLOWMESH_REQUIRE_API_KEY", True)
+        monkeypatch.setattr(env, "FLOWMESH_API_KEY", "")
+
+        with pytest.raises(RuntimeError, match="FLOWMESH_API_KEY"):
+            await resolve_system_principal("", logger)
 
     @pytest.mark.anyio
     async def test_provider_claiming_token_short_circuits(

@@ -1,4 +1,5 @@
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NewType
@@ -93,6 +94,7 @@ class WorkerAdapter(ABC):
         self.name = name
         self.config = config
         self.owner = owner
+        self._last_heartbeat_monotonic: float | None = None
 
     @property
     @abstractmethod
@@ -116,6 +118,16 @@ class WorkerAdapter(ABC):
         if self._worker_id is None:
             raise RuntimeError("Worker ID is not set")
         self._worker_id = None
+
+    def mark_heartbeat(self) -> None:
+        self._last_heartbeat_monotonic = time.monotonic()
+
+    def heartbeat_is_fresh(self) -> bool:
+        last_seen = self._last_heartbeat_monotonic
+        return (
+            last_seen is not None
+            and time.monotonic() - last_seen <= env.SERVER_HEARTBEAT_TTL
+        )
 
     @abstractmethod
     def get_info(self) -> WorkerInfo:

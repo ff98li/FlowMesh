@@ -7,6 +7,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from .. import env
 from ..hooks import PrincipalContext
 from .adapters.base import ProviderSpec, WorkerAdapter, WorkerTokenType
 from .adapters.docker import get_provider_spec as docker_provider_spec
@@ -16,6 +17,30 @@ from .registry import WorkerRegistry
 from .schemas import WorkerInfo, WorkerStatus
 
 _MAX_PARALLELISM: int = 16
+_DOCKER_REQUEST_FIELDS = frozenset(
+    {
+        "cuda_devices",
+        "gpu_count",
+        "network_bandwidth",
+        "tags",
+        "worker_alias",
+        "worker_cost_per_hour",
+        "worker_type",
+    }
+)
+_NATIVE_REQUEST_FIELDS = _DOCKER_REQUEST_FIELDS
+_VASTAI_REQUEST_FIELDS = frozenset(
+    {
+        "disk",
+        "label",
+        "network_bandwidth",
+        "order",
+        "search_limit",
+        "tags",
+        "worker_alias",
+        "worker_cost_per_hour",
+    }
+)
 
 
 class WorkerInitConfig(BaseModel):
@@ -183,11 +208,22 @@ class WorkerManager:
             self.logger.warning("WorkerManager is not started.")
             return
 
-        await self._stop_and_destroy_workers(self._registry.all_workers())
-        self._report_capacity_change()
-        for spec in self._providers.values():
-            spec.factory.cleanup()
-        self._registry.clear()
+        destroyed = await self._stop_and_destroy_workers(self._registry.all_workers())
+        for worker in destroyed:
+            self._registry.try_pop(worker.token)
+        if destroyed:
+            self._report_capacity_change()
+        if not self._registry.all_workers():
+            for spec in self._providers.values():
+                spec.factory.cleanup()
+        else:
+            self.logger.error(
+                "Worker manager stopped with %d worker(s) still running; "
+                "their resource reservations remain quarantined only for the "
+                "remaining lifetime of this supervisor process (quarantine is "
+                "not persisted across a crash or restart).",
+                len(self._registry.all_workers()),
+            )
         self._default_worker_config = None
         self._is_started = False
         self.logger.info("Worker manager stopped")
@@ -196,6 +232,7 @@ class WorkerManager:
         if not self.is_started:
             raise RuntimeError("WorkerManager not started")
 
+        self._validate_requested_worker_config(init_config)
         worker = self._create_worker(init_config)
         if init_config.init_on_start:
             started = await self._start_worker(worker)
@@ -243,8 +280,9 @@ class WorkerManager:
             return False
 
         success = await self._stop_and_destroy_worker(worker)
-        self._registry.try_pop_by_name(name)
-        self._report_capacity_change()
+        if success:
+            self._registry.try_pop_by_name(name)
+            self._report_capacity_change()
         return success
 
     async def destroy_workers(self, names: set[str] | None = None) -> None:
@@ -262,13 +300,42 @@ class WorkerManager:
                 raise ValueError(f"Workers not found: {', '.join(missing)}")
             workers = [self._registry.get_by_name(name) for name in names]
 
-        await self._stop_and_destroy_workers(workers)
-        if names is None:
-            self._registry.clear()
+        destroyed = await self._stop_and_destroy_workers(workers)
+        for worker in destroyed:
+            self._registry.try_pop(worker.token)
+        if destroyed:
+            self._report_capacity_change()
+        destroyed_ids = {id(worker) for worker in destroyed}
+        failed_names = sorted(
+            worker.name for worker in workers if id(worker) not in destroyed_ids
+        )
+        if failed_names:
+            raise RuntimeError(f"Failed to stop worker(s): {', '.join(failed_names)}")
+
+    def _validate_requested_worker_config(self, init_config: WorkerInitConfig) -> None:
+        provider = init_config.provider.strip().lower()
+        if env.FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES:
+            return
+        if init_config.worker_token is not None:
+            raise ValueError(
+                "Request cannot choose a worker token; set "
+                "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES=true to allow it"
+            )
+        requested_fields = set(init_config.worker_config)
+        if provider == "docker":
+            forbidden = requested_fields - _DOCKER_REQUEST_FIELDS
+        elif provider == "native":
+            forbidden = requested_fields - _NATIVE_REQUEST_FIELDS
+        elif provider == "vastai":
+            forbidden = requested_fields - _VASTAI_REQUEST_FIELDS
         else:
-            for name in names:
-                self._registry.try_pop_by_name(name)
-        self._report_capacity_change()
+            forbidden = set()
+        if forbidden:
+            names = ", ".join(sorted(forbidden))
+            raise ValueError(
+                f"Request cannot set privileged {provider} worker field(s): {names}; "
+                "set FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES=true to allow it"
+            )
 
     def _create_worker(self, init_config: WorkerInitConfig) -> WorkerAdapter:
         if not self.is_started:
@@ -299,8 +366,9 @@ class WorkerManager:
 
         started = await worker.start()
         if not started:
-            await self._stop_and_destroy_worker(worker)
-            self._registry.try_pop(worker.token)
+            destroyed = await self._stop_and_destroy_worker(worker)
+            if destroyed:
+                self._registry.try_pop(worker.token)
             return False
         return True
 
@@ -320,24 +388,30 @@ class WorkerManager:
         except Exception as exc:
             self.logger.debug("Failed to report capacity change: %s", exc)
 
-    async def _stop_and_destroy_workers(self, workers: list[WorkerAdapter]) -> None:
+    async def _stop_and_destroy_workers(
+        self, workers: list[WorkerAdapter]
+    ) -> list[WorkerAdapter]:
         if not workers:
-            return
+            return []
 
         max_workers = min(len(workers), _MAX_PARALLELISM)
         sema = asyncio.Semaphore(max_workers or 1)
 
-        async def stop_and_destroy(worker: WorkerAdapter) -> None:
+        async def stop_and_destroy(worker: WorkerAdapter) -> WorkerAdapter | None:
             async with sema:
-                await self._stop_and_destroy_worker(worker)
+                success = await self._stop_and_destroy_worker(worker)
+                return worker if success else None
 
-        await asyncio.gather(*(stop_and_destroy(worker) for worker in workers))
+        results = await asyncio.gather(
+            *(stop_and_destroy(worker) for worker in workers)
+        )
+        return [worker for worker in results if worker is not None]
 
     async def _stop_and_destroy_worker(self, worker: WorkerAdapter) -> bool:
         worker_name = worker.name
         success = True
 
-        if worker.status in (WorkerStatus.STARTING, WorkerStatus.RUNNING):
+        if worker.status is not WorkerStatus.STOPPING:
             self.logger.info("Stopping worker %s...", worker_name)
             try:
                 success = await worker.stop()
@@ -347,7 +421,18 @@ class WorkerManager:
                 )
                 success = False
         else:
-            self.logger.info("Destroying worker %s that is not running.", worker_name)
+            # STOPPING is not proof that the process/container/instance died.
+            # In particular, an outer asyncio timeout can cancel the coroutine
+            # while its blocking stop operation is still running in a thread.
+            success = False
+
+        if not success:
+            self.logger.error(
+                "Worker %s was not confirmed stopped; keeping it registered and "
+                "retaining its resource reservations.",
+                worker_name,
+            )
+            return False
 
         try:
             self._destroy_worker(worker)

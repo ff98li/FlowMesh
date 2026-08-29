@@ -2,7 +2,15 @@
 
 import pytest
 
-from server.config import PortForwardConfig
+from server.config import GrpcConfig, PortForwardConfig
+
+
+def test_grpc_config_reads_bind_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SERVER_GRPC_HOST", "127.0.0.1")
+
+    config = GrpcConfig.from_env()
+
+    assert config.host == "127.0.0.1"
 
 
 def test_port_forward_config_enables_capabilities_by_default(
