@@ -262,8 +262,14 @@ class SyncRedisClient:
             )
             client.ping()
         except Exception as exc:
-            self.logger.exception(
-                "Failed to connect to %s Redis (%s): %s", label, url, exc
+            # Some client/transport exceptions echo their constructor input.
+            # Log only the exception type so credentials cannot re-enter via
+            # either the URL argument or a traceback message.
+            self.logger.error(
+                "Failed to connect to %s Redis (%s): %s",
+                label,
+                _redact_url(url),
+                type(exc).__name__,
             )
             raise SystemExit(1) from exc
         self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
@@ -468,8 +474,13 @@ class AsyncRedisClient:
                 url, decode_responses=True, **_keepalive_kwargs(), **ssl_kwargs
             )
         except Exception as exc:
-            self.logger.exception(
-                "Failed to connect to %s Redis (%s): %s", label, url, exc
+            # See the synchronous path above: exception text is untrusted and
+            # may repeat a credential-bearing connection URL.
+            self.logger.error(
+                "Failed to connect to %s Redis (%s): %s",
+                label,
+                _redact_url(url),
+                type(exc).__name__,
             )
             raise SystemExit(1) from exc
         self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
