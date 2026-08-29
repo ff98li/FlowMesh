@@ -271,9 +271,12 @@ class SyncRedisClient:
                 _redact_url(url),
                 type(exc).__name__,
             )
-            raise SystemExit(1) from exc
-        self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
-        return client
+        else:
+            self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
+            return client
+        # Raise after leaving the handler so a credential-bearing exception is
+        # not retained as SystemExit.__context__ for a future crash reporter.
+        raise SystemExit(1)
 
     # ---- String helpers ----
     def get(self, key: str) -> str | None:
@@ -419,9 +422,14 @@ class SyncRedisClient:
     # ---- Maintenance ----
     def flush_all(self) -> None:
         self._control.flushdb()
-        self.logger.info("Cleared Redis database at %s (control)", self.control_url)
+        self.logger.info(
+            "Cleared Redis database at %s (control)", _redact_url(self.control_url)
+        )
         self._telemetry.flushdb()
-        self.logger.info("Cleared Redis database at %s (telemetry)", self.telemetry_url)
+        self.logger.info(
+            "Cleared Redis database at %s (telemetry)",
+            _redact_url(self.telemetry_url),
+        )
 
 
 def _awaitable[T](value: Awaitable[T] | T) -> Awaitable[T]:
@@ -482,9 +490,11 @@ class AsyncRedisClient:
                 _redact_url(url),
                 type(exc).__name__,
             )
-            raise SystemExit(1) from exc
-        self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
-        return client
+        else:
+            self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
+            return client
+        # Match the synchronous path and deliberately discard exception text.
+        raise SystemExit(1)
 
     # ---- String helpers ----
     async def get(self, key: str) -> str | None:
@@ -650,9 +660,14 @@ class AsyncRedisClient:
 
     async def flush_all(self) -> None:
         await self._control.flushdb()
-        self.logger.info("Cleared Redis database at %s (control)", self.control_url)
+        self.logger.info(
+            "Cleared Redis database at %s (control)", _redact_url(self.control_url)
+        )
         await self._telemetry.flushdb()
-        self.logger.info("Cleared Redis database at %s (telemetry)", self.telemetry_url)
+        self.logger.info(
+            "Cleared Redis database at %s (telemetry)",
+            _redact_url(self.telemetry_url),
+        )
 
 
 class RedisClient:
